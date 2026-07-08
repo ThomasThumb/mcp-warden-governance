@@ -57,6 +57,11 @@ pub struct ControlPlaneConfig {
     /// insufficient on its own.
     #[serde(default = "default_true")]
     pub require_agent_proof: bool,
+    /// Ask the control plane to re-check each token id before forwarding the
+    /// tool call. This enforces revocation and one-time `jti` semantics instead
+    /// of relying only on the gateway's offline signature verification.
+    #[serde(default = "default_true")]
+    pub require_token_introspection: bool,
 }
 
 fn default_grace_minutes() -> i64 {
@@ -207,6 +212,14 @@ impl WardenConfig {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {path:?}: {e}"))?;
         let cfg: WardenConfig = toml::from_str(&text)?;
+        if let Some(cp) = &cfg.control_plane {
+            if cp.require_agent_proof && !cp.require_token_introspection {
+                anyhow::bail!(
+                    "require_agent_proof=true requires require_token_introspection=true; \
+                     proof-of-possession without one-time token introspection is replayable"
+                );
+            }
+        }
         std::fs::create_dir_all(&cfg.state_dir)?;
         Ok(cfg)
     }

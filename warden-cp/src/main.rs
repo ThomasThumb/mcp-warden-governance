@@ -1,5 +1,7 @@
+mod audit_anchor;
 mod auth;
 mod db;
+mod external_command;
 mod identity;
 mod models;
 mod notify;
@@ -10,7 +12,7 @@ mod scim;
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::Router;
-use routes::AppState;
+use routes::{AppState, AuditChainTail};
 use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,18 +20,66 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-async fn load_chain_tail(pool: &db::DbPool) -> String {
-    let row = sqlx::query("SELECT entry_hash FROM audit_events ORDER BY ts DESC LIMIT 1")
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+async fn load_chain_tail(pool: &db::DbPool) -> AuditChainTail {
+    let row = sqlx::query(
+        "SELECT seq, entry_hash FROM audit_events
+         ORDER BY CASE WHEN seq IS NULL THEN 0 ELSE 1 END DESC, seq DESC, ts DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
     match row {
-        Some(r) => r
-            .try_get::<String, _>("entry_hash")
-            .unwrap_or_else(|_| GENESIS_HASH.to_string()),
-        None => GENESIS_HASH.to_string(),
+        Some(r) => AuditChainTail {
+            seq: r
+                .try_get::<Option<i64>, _>("seq")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            hash: r
+                .try_get::<String, _>("entry_hash")
+                .unwrap_or_else(|_| GENESIS_HASH.to_string()),
+        },
+        None => AuditChainTail {
+            seq: 0,
+            hash: GENESIS_HASH.to_string(),
+        },
     }
+}
+
+fn enforce_safe_bind_addr(bind_addr: &str) -> anyhow::Result<()> {
+    if is_loopback_bind(bind_addr) || truthy_env("WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK") {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind plaintext warden-cp to non-loopback address {bind_addr}; \
+         terminate TLS at a local reverse proxy or set \
+         WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK=true only in a trusted private test network"
+    )
+}
+
+fn is_loopback_bind(bind_addr: &str) -> bool {
+    let host = bind_addr
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(bind_addr)
+        .trim_matches(['[', ']']);
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn audit_ml_dsa_checkpoint_interval() -> i64 {
+    std::env::var("AUDIT_ML_DSA_CHECKPOINT_INTERVAL")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(1)
 }
 
 #[tokio::main]
@@ -39,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://warden-cp.db".to_string());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    enforce_safe_bind_addr(&bind_addr)?;
     let webhook_url = std::env::var("APPROVAL_WEBHOOK_URL").ok();
     let trust_domain = std::env::var("TRUST_DOMAIN").unwrap_or_else(|_| "warden.local".to_string());
     let signing_key_path = PathBuf::from(
@@ -64,8 +115,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("ML-DSA-65 signer public key: {key}");
     }
 
+    routes::seal_legacy_audit_if_needed(&pool, signer.as_ref()).await?;
     let chain_tail = load_chain_tail(&pool).await;
     let oidc = oidc::OidcConfig::from_env()?.map(Arc::new);
+    let audit_anchor = Arc::new(audit_anchor::AuditAnchor::from_env()?);
+    let audit_ml_dsa_checkpoint_interval = audit_ml_dsa_checkpoint_interval();
 
     let state = AppState {
         pool,
@@ -74,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
         notifier: Arc::new(notify::Notifier::new(webhook_url)),
         trust_domain,
         audit_chain_tail: Arc::new(AsyncMutex::new(chain_tail)),
+        audit_anchor,
+        audit_ml_dsa_checkpoint_interval,
         rate_limits: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
@@ -120,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
             post(routes::revoke_agent_session),
         )
         .route("/v1/token", post(routes::issue_token))
+        .route("/v1/token/introspect", post(routes::introspect_token))
         .route("/v1/signer/public-key", get(routes::signer_public_key))
         .route(
             "/v1/org-policy/:scope",

@@ -67,19 +67,85 @@ async fn apply_schema(pool: &DbPool) -> anyhow::Result<()> {
         sqlx::query(trimmed).execute(pool).await?;
     }
     ensure_columns(pool).await?;
+    ensure_indexes(pool).await?;
     Ok(())
 }
 
 async fn ensure_columns(pool: &DbPool) -> anyhow::Result<()> {
-    if sqlx::query("SELECT active FROM principals LIMIT 1")
-        .execute(pool)
-        .await
-        .is_err()
-    {
-        sqlx::query("ALTER TABLE principals ADD COLUMN active BIGINT NOT NULL DEFAULT 1")
-            .execute(pool)
-            .await?;
-    }
+    ensure_column(
+        pool,
+        "principals",
+        "active",
+        "ALTER TABLE principals ADD COLUMN active BIGINT NOT NULL DEFAULT 1",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "seq",
+        "ALTER TABLE audit_events ADD COLUMN seq BIGINT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "canonical_version",
+        "ALTER TABLE audit_events ADD COLUMN canonical_version BIGINT NOT NULL DEFAULT 1",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "checkpoint_signed_at",
+        "ALTER TABLE audit_events ADD COLUMN checkpoint_signed_at TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "checkpoint_sig_b64",
+        "ALTER TABLE audit_events ADD COLUMN checkpoint_sig_b64 TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "checkpoint_ml_dsa_alg",
+        "ALTER TABLE audit_events ADD COLUMN checkpoint_ml_dsa_alg TEXT",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "audit_events",
+        "checkpoint_ml_dsa_sig_b64",
+        "ALTER TABLE audit_events ADD COLUMN checkpoint_ml_dsa_sig_b64 TEXT",
+    )
+    .await?;
 
+    Ok(())
+}
+
+async fn ensure_indexes(pool: &DbPool) -> anyhow::Result<()> {
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_seq ON audit_events(seq)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_issued_tokens_session ON issued_tokens(agent_session_id)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_column(
+    pool: &DbPool,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> anyhow::Result<()> {
+    let probe = format!("SELECT {column} FROM {table} LIMIT 1");
+    if sqlx::query(&probe).execute(pool).await.is_err() {
+        sqlx::query(alter_sql).execute(pool).await?;
+    }
     Ok(())
 }

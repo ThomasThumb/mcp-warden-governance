@@ -87,6 +87,8 @@ pub struct ToolFingerprintView {
 #[derive(Debug, Serialize, Clone)]
 pub struct AuditEventView {
     pub id: String,
+    pub seq: Option<i64>,
+    pub canonical_version: Option<i64>,
     pub ts: String,
     pub gateway_id: String,
     pub agent_session_id: Option<String>,
@@ -99,6 +101,7 @@ pub struct AuditEventView {
     pub result_bytes: Option<i64>,
     pub prev_hash: String,
     pub entry_hash: String,
+    pub checkpoint_signed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -227,8 +230,25 @@ pub struct IssueTokenRequest {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct IssuedToken {
-    pub token: String, // header.payload.signature, base64url each segment
+    pub token: String, // base64url-encoded signed envelope with protected header + payload
     pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IntrospectTokenRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct IntrospectTokenResponse {
+    pub active: bool,
+    pub agent_session_id: Option<String>,
+    pub principal_id: Option<String>,
+    pub gateway_id: Option<String>,
+    pub server_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub jti: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

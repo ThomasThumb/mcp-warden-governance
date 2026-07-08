@@ -4,7 +4,9 @@ use crate::control_plane::CpClient;
 use crate::injection_filter::InjectionFilter;
 use crate::integrity::IntegrityGuard;
 use crate::policy;
-use crate::token::{agent_session_id_from_spiffe, verify_agent_proof, verify_token};
+use crate::token::{
+    agent_session_id_from_spiffe, token_audience, verify_agent_proof, verify_token,
+};
 use crate::upstream::Upstream;
 
 use rmcp::model::{
@@ -139,13 +141,13 @@ impl Gateway {
     async fn record_audit(
         &self,
         identity: &CallIdentity,
-        server_id: &str,
-        tool_name: &str,
+        tool: (&str, &str),
         decision: &str,
         args_fingerprint: String,
         injection_flags: &[&'static str],
         result_bytes: Option<usize>,
     ) {
+        let (server_id, tool_name) = tool;
         if let Err(e) = self.audit.record(&AuditEvent {
             ts: AuditLog::now(),
             server: server_id,
@@ -237,7 +239,7 @@ impl Gateway {
         Ok((token, proof))
     }
 
-    fn verify_call_identity(
+    async fn verify_call_identity(
         &self,
         server_id: &str,
         tool_name: &str,
@@ -270,6 +272,7 @@ impl Gateway {
             signer_key,
             cp_cfg.ml_dsa_public_key_b64.as_deref(),
             cp_cfg.require_ml_dsa_token_signature,
+            &token_audience(&cp_cfg.gateway_id, server_id, tool_name),
             token,
         )
         .map_err(|e| Self::deny(format!("invalid agent token: {e}")))?;
@@ -297,6 +300,48 @@ impl Gateway {
             };
             verify_agent_proof(&cnf.ed25519_public_key_b64, token, args_fingerprint, proof)
                 .map_err(|e| Self::deny(format!("invalid agent proof: {e}")))?;
+        }
+
+        if cp_cfg.require_token_introspection {
+            let Some(cp) = &self.cp else {
+                return Err(Self::deny(
+                    "token introspection is required but no control-plane client is configured",
+                ));
+            };
+            let introspection = cp
+                .introspect_token(token)
+                .await
+                .map_err(|e| Self::deny(format!("token introspection failed: {e}")))?;
+            if !introspection.active {
+                return Err(Self::deny(format!(
+                    "agent token is inactive: {}",
+                    introspection
+                        .reason
+                        .as_deref()
+                        .unwrap_or("control plane rejected token")
+                )));
+            }
+            if introspection.gateway_id.as_deref() != Some(cp_cfg.gateway_id.as_str())
+                || introspection.server_id.as_deref() != Some(server_id)
+                || introspection.tool_name.as_deref() != Some(tool_name)
+                || introspection.jti.as_deref() != claims.jti.as_deref()
+            {
+                return Err(Self::deny(
+                    "token introspection response did not match the requested call",
+                ));
+            }
+            if let Some(expected_session) = agent_session_id_from_spiffe(&claims.sub) {
+                if introspection.agent_session_id.as_deref() != Some(expected_session.as_str()) {
+                    return Err(Self::deny(
+                        "token introspection response did not match the token subject",
+                    ));
+                }
+            }
+            if introspection.principal_id.as_deref() != Some(claims.act.sub.as_str()) {
+                return Err(Self::deny(
+                    "token introspection response did not match the token actor",
+                ));
+            }
         }
 
         Ok(CallIdentity {
@@ -421,19 +466,21 @@ impl ServerHandler for Gateway {
             .unwrap_or(serde_json::Value::Null);
         let args_fingerprint = AuditLog::fingerprint_args(&args_value);
 
-        let identity = match self.verify_call_identity(
-            server_id,
-            tool_name,
-            token.as_deref(),
-            proof.as_deref(),
-            &args_fingerprint,
-        ) {
+        let identity = match self
+            .verify_call_identity(
+                server_id,
+                tool_name,
+                token.as_deref(),
+                proof.as_deref(),
+                &args_fingerprint,
+            )
+            .await
+        {
             Ok(identity) => identity,
             Err(e) => {
                 self.record_audit(
                     &CallIdentity::default(),
-                    server_id,
-                    tool_name,
+                    (server_id, tool_name),
                     "denied",
                     args_fingerprint,
                     &[],
@@ -451,8 +498,7 @@ impl ServerHandler for Gateway {
             Err(e) => {
                 self.record_audit(
                     &identity,
-                    server_id,
-                    tool_name,
+                    (server_id, tool_name),
                     "denied",
                     args_fingerprint,
                     &[],
@@ -485,8 +531,7 @@ impl ServerHandler for Gateway {
             policy::Decision::Deny(reason) => {
                 self.record_audit(
                     &identity,
-                    server_id,
-                    tool_name,
+                    (server_id, tool_name),
                     "denied",
                     args_fingerprint,
                     &[],
@@ -511,8 +556,7 @@ impl ServerHandler for Gateway {
                         Ok(_) => {
                             self.record_audit(
                                 &identity,
-                                server_id,
-                                tool_name,
+                                (server_id, tool_name),
                                 "denied",
                                 args_fingerprint,
                                 &[],
@@ -524,8 +568,7 @@ impl ServerHandler for Gateway {
                         Err(e) => {
                             self.record_audit(
                                 &identity,
-                                server_id,
-                                tool_name,
+                                (server_id, tool_name),
                                 "denied",
                                 args_fingerprint,
                                 &[],
@@ -552,8 +595,7 @@ impl ServerHandler for Gateway {
                         "denied" => {
                             self.record_audit(
                                 &identity,
-                                server_id,
-                                tool_name,
+                                (server_id, tool_name),
                                 "denied",
                                 args_fingerprint,
                                 &[],
@@ -567,8 +609,7 @@ impl ServerHandler for Gateway {
                         _ => {
                             self.record_audit(
                                 &identity,
-                                server_id,
-                                tool_name,
+                                (server_id, tool_name),
                                 "pending_approval",
                                 args_fingerprint,
                                 &[],
@@ -583,8 +624,7 @@ impl ServerHandler for Gateway {
                 } else {
                     self.record_audit(
                         &identity,
-                        server_id,
-                        tool_name,
+                        (server_id, tool_name),
                         "pending_approval",
                         args_fingerprint,
                         &[],
@@ -605,8 +645,7 @@ impl ServerHandler for Gateway {
         if self.injection_filter.should_block(&args_text) {
             self.record_audit(
                 &identity,
-                server_id,
-                tool_name,
+                (server_id, tool_name),
                 "blocked_injection",
                 args_fingerprint,
                 &arg_hits,
@@ -641,8 +680,7 @@ impl ServerHandler for Gateway {
                             if self.injection_filter.should_block(text) {
                                 self.record_audit(
                                     &identity,
-                                    server_id,
-                                    tool_name,
+                                    (server_id, tool_name),
                                     "blocked_injection",
                                     args_fingerprint,
                                     &result_flags,
@@ -687,8 +725,7 @@ impl ServerHandler for Gateway {
 
         self.record_audit(
             &identity,
-            server_id,
-            tool_name,
+            (server_id, tool_name),
             if result_flags.is_empty() {
                 "allowed"
             } else {

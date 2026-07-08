@@ -14,11 +14,12 @@ live.
 - **Scoped auth** - `POST /v1/agent-sessions` mints a short-lived,
   SPIFFE-shaped identity per agent session, delegated from a human/service
   principal; `POST /v1/token` issues a token scoped to exactly one
-  (gateway, server, tool) triple with a delegation-chain (`act`) claim - see
-  "Identity model" below.
+  (gateway, server, tool) triple with a delegation-chain (`act`) claim and a
+  one-time token id - see "Identity model" below.
 - **Audit + approvals** - `POST /v1/audit` ingests the who/what/when/where
-  ledger; `POST /v1/approvals` + `GET/POST /v1/approvals/:id` is the
-  step-up-approval workflow, KISS-notified (see `notify.rs`).
+  ledger with hash chaining plus signed checkpoints; `POST /v1/approvals` +
+  `GET/POST /v1/approvals/:id` is the step-up-approval workflow,
+  KISS-notified (see `notify.rs`).
 - **Admin/security visibility** - root can create non-root principals and
   API keys, revoke keys, and read summary, gateway, session, fingerprint, and
   audit-event views without connecting directly to the database.
@@ -86,11 +87,13 @@ cp .env.example .env
 docker compose --env-file .env up --build
 ```
 
-For non-local deployment, put `warden-cp` behind a TLS 1.3 reverse proxy or
-private network ingress. Prefer a provider/stack with hybrid ML-KEM key
-establishment where available. Postgres should be backed up with normal
-database tooling (`pg_dump`, managed-service PITR, or storage snapshots) and
-monitored like production security infrastructure.
+For non-local deployment, keep `warden-cp` bound to localhost behind a TLS
+1.3 reverse proxy or private network ingress. The binary refuses non-loopback
+plaintext binds unless `WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK=true` is set
+explicitly for a trusted private test network. Prefer a provider/stack with
+hybrid ML-KEM key establishment where available. Postgres should be backed up
+with normal database tooling (`pg_dump`, managed-service PITR, or storage
+snapshots) and monitored like production security infrastructure.
 
 TLS/private-ingress examples live in `deploy/caddy/`. The Caddy example keeps
 `warden-cp` on localhost behind HTTPS and documents the Go TLS hybrid
@@ -118,6 +121,45 @@ The proof starts a disposable Caddy container, uses a Go 1.26 client restricted
 to `X25519MLKEM768`, and fails unless the negotiated TLS group is exactly
 `X25519MLKEM768`.
 
+Supply-chain CI and release provenance are documented in the repository root
+`SUPPLY_CHAIN.md`. Release images should be verified with GitHub artifact
+attestations, Sigstore/cosign, and SLSA provenance before deployment.
+
+### Audit anchoring and rollback detection
+
+New audit rows are signed and hash-chained in the database. To detect database
+rollback/truncation, publish each signed high-water mark to storage that
+`warden-cp` cannot rewrite:
+
+```bash
+export AUDIT_ANCHOR_FILE="/mnt/worm/warden-cp/audit-anchor.jsonl"
+export AUDIT_ANCHOR_REQUIRED="true"
+```
+
+`AUDIT_ANCHOR_FILE` is append-only JSONL. Put it on WORM/object-lock storage,
+a protected remote mount, or another append-only sink; a normal local file on
+the same compromised host is only operational evidence, not a hard boundary.
+When `AUDIT_ANCHOR_REQUIRED=true`, `/v1/audit/verify` requires the latest
+anchor to match the current DB tail and audit ingest fails closed if anchoring
+cannot be written.
+
+For production WORM/object-lock anchoring, prefer `AUDIT_ANCHOR_COMMAND`.
+The command adapter contract and an S3 Object Lock adapter are documented in
+`docs/external-integrations.md`.
+
+Existing pre-v2 audit rows are sealed once at startup in `audit_legacy_seals`.
+If legacy rows exist and the seal no longer matches, `/v1/audit/verify` fails.
+
+Ed25519 signs every audit row. By default, ML-DSA-65 also signs every audit
+row when the ML-DSA signer is configured:
+
+```bash
+export AUDIT_ML_DSA_CHECKPOINT_INTERVAL=1
+```
+
+Raise the interval only for very high-volume deployments where you have
+accepted periodic PQ checkpoints and also publish to an external anchor.
+
 ## PQC posture
 
 Scoped tokens are hybrid signed by default: Ed25519 remains the mature
@@ -126,6 +168,12 @@ Gateways should require both signatures during the migration window. The
 implementation uses RustCrypto `ml-dsa`; its upstream docs still warn that
 the crate has not been independently audited, so do not remove Ed25519 or
 treat ML-DSA as your sole trust anchor yet.
+
+For production key custody, set `WARDEN_SIGNER_COMMAND` and keep the Ed25519
+and ML-DSA private keys in KMS, HSM, Vault Transit, PKCS#11, Windows
+CNG/DPAPI, or another managed key boundary. The command protocol is documented
+in `docs/external-integrations.md`; `warden-cp` verifies returned signatures
+against configured public keys before accepting them.
 
 For "harvest now, decrypt later" risk, transport confidentiality is the
 priority. Use a TLS 1.3 reverse proxy or TLS provider that supports a
@@ -137,18 +185,30 @@ and signatures.
 
 ## Security hardening (this round)
 
-Two holes from v0.1 are fixed:
+Key holes from v0.1 are fixed:
 - **Every endpoint now requires `Authorization: Bearer <key>`.** First run
   prints a root key once (`auth.rs::bootstrap_root_key_if_needed`) - save it,
   it can't be recovered, only revoked. `decide_approval`'s `decided_by` now
   comes from that authenticated identity, not a field in the request body.
-- **The signing key persists** (`SIGNING_KEY_PATH`, default
-  `warden-cp-signing.key`, written with 0600 permissions on Unix). Restarting
-  the service no longer invalidates every token it's ever issued.
+- **The signing key persists for local dev** (`SIGNING_KEY_PATH`, default
+  `warden-cp-signing.key`, written with owner-only permissions). Production
+  can set `WARDEN_SIGNER_COMMAND` so private signing keys stay outside the
+  process in a KMS/HSM/OS-keystore-backed adapter.
+- **Scoped tokens are signed as protected envelopes.** The signed input now
+  includes the token header, algorithm, key IDs, audience, `nbf`, `jti`, and
+  payload. Gateways use strict Ed25519 verification and require ML-DSA-65 by
+  default.
+- **Token IDs are online-checked.** `/v1/token/introspect` verifies the
+  envelope, enforces agent-session revocation/expiry, and marks the token id
+  used so replayed calls fail closed.
+- **Audit rows are canonicalized and signed.** New audit rows use
+  domain-separated, length-prefixed hashing with a monotonic sequence number
+  and a control-plane-signed checkpoint. `/v1/audit/verify` streams rows and
+  verifies both the chain and the signatures.
 
 Plus: agent-session revocation (`POST /v1/agent-sessions/:id/revoke`),
 hash-chained audit log with a verify endpoint (`GET /v1/audit/verify`), a
-coarse fixed-window rate limiter on write endpoints, and org-authored Rego
+sliding-window rate limiter on write endpoints, and org-authored Rego
 policy storage/versioning (`PUT/GET /v1/org-policy/:scope` - the enforcement
 side lives in `mcp-warden`'s `rego_policy.rs`, this is just the source of
 truth and version history).
@@ -183,14 +243,11 @@ See `COMPLIANCE.md` for how these map to SOC 2 / ISO 42001 / EU AI Act.
 
 ## Explicit gaps - not built, not pretended
 
-- **No TLS.** `axum::serve` here is plain HTTP. Bearer tokens, approval
-  decisions, and Rego policy source all cross the wire in the clear the
-  moment `BIND_ADDR` is anything other than localhost. This is arguably the
-  single most urgent gap in the whole system once you have gateways on a
-  different machine than the control plane - terminate TLS in front of this,
-  and prefer hybrid ML-KEM key establishment where your TLS stack supports it.
-  Not implemented here because certificate management is a deployment
-  decision, not something to guess at blind.
+- **No built-in TLS.** `axum::serve` here is plain HTTP and refuses
+  non-loopback binds by default. For anything beyond same-host development,
+  terminate TLS in front of this and prefer hybrid ML-KEM key establishment
+  where your TLS stack supports it. Certificate management is still a
+  deployment decision, not something this binary guesses at blind.
 - **OIDC/SCIM are protocol plumbing, not IdP magic.** OIDC login and SCIM
   Users/Groups are implemented, including group-backed role inheritance and
   lifecycle revocation. You still need to configure the IdP app, redirect URI,
@@ -222,6 +279,9 @@ export BIND_ADDR="127.0.0.1:7878"
 export TRUST_DOMAIN="acme.corp"
 export SIGNING_KEY_PATH="warden-cp-signing.key"   # back this file up - see below
 export ML_DSA_SIGNING_KEY_PATH="warden-cp-ml-dsa65.key" # back this up too
+export AUDIT_ANCHOR_FILE="/mnt/worm/warden-cp/audit-anchor.jsonl" # optional but recommended
+export AUDIT_ANCHOR_REQUIRED="true" # fail closed if the external anchor is unavailable
+export AUDIT_ML_DSA_CHECKPOINT_INTERVAL=1
 export APPROVAL_WEBHOOK_URL="https://hooks.slack.com/services/..."  # optional, omit for CLI-only
 
 cargo run
@@ -295,4 +355,4 @@ nullclaw contributors. See `THIRD_PARTY_NOTICES.md`.
 1. Real SPIRE integration behind the `agent_sessions` table.
 2. Richer dashboard workflows for approval decisions, SCIM status, and policy editing.
 3. FIPS 140-3 validated crypto provider option for deployments that require formal validation.
-4. External append-only audit anchoring for multi-replica HA deployments.
+4. Consensus-backed or per-shard audit sequencing for multi-replica HA deployments.

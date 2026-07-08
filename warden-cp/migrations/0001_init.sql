@@ -153,15 +153,20 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 -- The "who, what, when, where" ledger. principal_id and agent_session_id
 -- together give you the full delegation chain (mirrors the `act` claim
 -- pattern from OAuth 2.0 Token Exchange, RFC 8693) for every single call.
--- entry_hash = sha256(prev_hash || canonical event fields) - a tamper-evident
--- chain: editing or deleting any past row breaks every entry_hash after it.
+-- entry_hash = sha256(domain-separated, length-prefixed canonical event
+-- fields). Each v2 row also carries a control-plane-signed checkpoint over
+-- (seq, entry_hash, checkpoint_signed_at), so a DB-only writer cannot rewrite
+-- history and recompute public SHA-256 hashes without also forging the signer.
 -- Caveat, stated plainly: this chain is maintained by a single in-process
--- mutex (see main.rs) and only guarantees tamper-evidence for a single
--- warden-cp instance. A multi-replica HA deployment needs a different
--- chaining strategy (per-shard chains, or an external append-only log) -
--- that's on the backlog, not solved here.
+-- mutex (see main.rs) and only guarantees in-DB sequencing for a single
+-- warden-cp instance. Set AUDIT_ANCHOR_FILE to an external/WORM append-only
+-- sink so /v1/audit/verify can detect database rollback or truncation.
+-- A multi-replica HA deployment still needs a per-shard or consensus-backed
+-- chaining strategy.
 CREATE TABLE IF NOT EXISTS audit_events (
     id                  TEXT PRIMARY KEY,
+    seq                 BIGINT UNIQUE,
+    canonical_version   BIGINT NOT NULL DEFAULT 2,
     ts                  TEXT NOT NULL,
     gateway_id          TEXT NOT NULL,      -- where
     agent_session_id    TEXT,                -- who (agent)
@@ -173,7 +178,32 @@ CREATE TABLE IF NOT EXISTS audit_events (
     injection_flags     TEXT NOT NULL,       -- JSON array, stored as text for portability
     result_bytes        INTEGER,
     prev_hash           TEXT NOT NULL,
-    entry_hash          TEXT NOT NULL
+    entry_hash          TEXT NOT NULL,
+    checkpoint_signed_at TEXT,
+    checkpoint_sig_b64  TEXT,
+    checkpoint_ml_dsa_alg TEXT,
+    checkpoint_ml_dsa_sig_b64 TEXT
+);
+
+CREATE TABLE IF NOT EXISTS issued_tokens (
+    jti                 TEXT PRIMARY KEY,
+    agent_session_id    TEXT NOT NULL REFERENCES agent_sessions(id),
+    gateway_id          TEXT NOT NULL,
+    server_id           TEXT NOT NULL,
+    tool_name           TEXT NOT NULL,
+    issued_at           TEXT NOT NULL,
+    not_before          TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    used_at             TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_legacy_seals (
+    id                  TEXT PRIMARY KEY,
+    last_entry_hash     TEXT NOT NULL,
+    sealed_at           TEXT NOT NULL,
+    seal_sig_b64        TEXT NOT NULL,
+    seal_ml_dsa_alg     TEXT,
+    seal_ml_dsa_sig_b64 TEXT
 );
 
 -- Per-scope, org-authored Rego policy (see mcp-warden's rego_policy.rs for
@@ -189,6 +219,7 @@ CREATE TABLE IF NOT EXISTS org_policies (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
+CREATE INDEX IF NOT EXISTS idx_issued_tokens_session ON issued_tokens(agent_session_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approval_requests(status);
 CREATE INDEX IF NOT EXISTS idx_principal_roles_role ON principal_roles(role);
 CREATE INDEX IF NOT EXISTS idx_principal_identities_principal ON principal_identities(principal_id);

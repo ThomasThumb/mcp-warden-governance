@@ -6,6 +6,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{Duration, Utc};
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::{HashMap, VecDeque};
@@ -13,11 +14,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
+use crate::audit_anchor::AuditAnchorRecord;
 use crate::auth::AuthedPrincipal;
 use crate::db::{DbPool, DbRow};
-use crate::identity::{mint_spiffe_id, ActorClaim, HybridSigner, TokenClaims};
+use crate::identity::{mint_spiffe_id, ActorClaim, AuditSignatureParts, HybridSigner, TokenClaims};
 use crate::models::*;
 use crate::notify::Notifier;
+
+#[derive(Clone)]
+pub struct AuditChainTail {
+    pub seq: i64,
+    pub hash: String,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,12 +37,20 @@ pub struct AppState {
     /// Tail of the audit hash chain, serialized through a mutex so
     /// concurrent ingests can't fork it. See migrations/0001_init.sql's
     /// audit_events comment for the single-instance caveat.
-    pub audit_chain_tail: Arc<tokio::sync::Mutex<String>>,
+    pub audit_chain_tail: Arc<tokio::sync::Mutex<AuditChainTail>>,
+    /// Optional external/WORM high-water mark sink for rollback/truncation
+    /// detection outside the mutable audit_events table.
+    pub audit_anchor: Arc<crate::audit_anchor::AuditAnchor>,
+    /// Ed25519 signs every audit row; ML-DSA signs every row by default. The
+    /// interval exists only for deployments that deliberately accept periodic
+    /// PQ checkpoints plus an external anchor at very high volume.
+    pub audit_ml_dsa_checkpoint_interval: i64,
     /// Sliding-window rate limiter: principal_id -> request timestamps.
     pub rate_limits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const AUDIT_CANONICAL_VERSION_V2: i64 = 2;
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_MAX_PER_WINDOW: u32 = 120;
 
@@ -301,7 +317,7 @@ pub async fn create_api_key(
         return Err((StatusCode::NOT_FOUND, "principal not found".into()));
     }
 
-    let raw_key = format!("warden_key_{}", Uuid::new_v4().simple());
+    let raw_key = crate::auth::random_bearer_token("warden_key");
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     sqlx::query(
@@ -889,6 +905,8 @@ fn row_to_audit_event(r: &DbRow) -> anyhow::Result<AuditEventView> {
     let flags: String = r.try_get("injection_flags")?;
     Ok(AuditEventView {
         id: r.try_get("id")?,
+        seq: r.try_get("seq").ok(),
+        canonical_version: r.try_get("canonical_version").ok(),
         ts: r.try_get("ts")?,
         gateway_id: r.try_get("gateway_id")?,
         agent_session_id: r.try_get("agent_session_id").ok(),
@@ -901,6 +919,7 @@ fn row_to_audit_event(r: &DbRow) -> anyhow::Result<AuditEventView> {
         result_bytes: r.try_get("result_bytes").ok(),
         prev_hash: r.try_get("prev_hash")?,
         entry_hash: r.try_get("entry_hash")?,
+        checkpoint_signed_at: r.try_get("checkpoint_signed_at").ok(),
     })
 }
 
@@ -1300,6 +1319,149 @@ fn row_to_approval(r: &DbRow) -> anyhow::Result<ApprovalRequest> {
     })
 }
 
+fn token_audience(gateway_id: &str, server_id: &str, tool_name: &str) -> String {
+    format!("warden-mcp:{gateway_id}:{server_id}:{tool_name}")
+}
+
+fn agent_session_id_from_spiffe(spiffe_id: &str) -> Option<String> {
+    let session_id = spiffe_id.rsplit_once("/agent/")?.1;
+    Uuid::parse_str(session_id).ok()?;
+    Some(session_id.to_string())
+}
+
+struct AuditHashFields<'a> {
+    seq: i64,
+    prev_hash: &'a str,
+    ts: &'a str,
+    gateway_id: &'a str,
+    agent_session_id: Option<&'a str>,
+    principal_id: &'a str,
+    server_id: &'a str,
+    tool_name: &'a str,
+    decision: &'a str,
+    args_fingerprint: &'a str,
+    injection_flags: &'a str,
+    result_bytes: Option<i64>,
+}
+
+fn audit_entry_hash_v2(fields: AuditHashFields<'_>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"warden-cp.audit-event.v2\0");
+    hash_i64(&mut hasher, fields.seq);
+    hash_str(&mut hasher, fields.prev_hash);
+    hash_str(&mut hasher, fields.ts);
+    hash_str(&mut hasher, fields.gateway_id);
+    hash_opt_str(&mut hasher, fields.agent_session_id);
+    hash_str(&mut hasher, fields.principal_id);
+    hash_str(&mut hasher, fields.server_id);
+    hash_str(&mut hasher, fields.tool_name);
+    hash_str(&mut hasher, fields.decision);
+    hash_str(&mut hasher, fields.args_fingerprint);
+    hash_str(&mut hasher, fields.injection_flags);
+    hash_opt_i64(&mut hasher, fields.result_bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn audit_requires_ml_dsa_checkpoint(seq: i64, interval: i64) -> bool {
+    seq == 1 || interval <= 1 || seq % interval == 0
+}
+
+fn legacy_audit_entry_hash(fields: AuditHashFields<'_>) -> String {
+    let canonical = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        fields.prev_hash,
+        fields.ts,
+        fields.gateway_id,
+        fields.agent_session_id.unwrap_or(""),
+        fields.principal_id,
+        fields.server_id,
+        fields.tool_name,
+        fields.decision,
+        fields.args_fingerprint,
+        fields.injection_flags,
+        fields.result_bytes.unwrap_or(-1)
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_i64(hasher: &mut Sha256, value: i64) {
+    hasher.update(value.to_be_bytes());
+}
+
+fn hash_str(hasher: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_opt_str(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_str(hasher, value);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_opt_i64(hasher: &mut Sha256, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_i64(hasher, value);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+pub async fn seal_legacy_audit_if_needed(
+    pool: &DbPool,
+    signer: &HybridSigner,
+) -> anyhow::Result<()> {
+    let existing = sqlx::query("SELECT id FROM audit_legacy_seals WHERE id = 'legacy-v1'")
+        .fetch_optional(pool)
+        .await?;
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    let Some(row) = sqlx::query(
+        "SELECT entry_hash FROM audit_events
+         WHERE canonical_version < $1 OR canonical_version IS NULL
+         ORDER BY CASE WHEN seq IS NULL THEN 0 ELSE 1 END DESC, seq DESC, ts DESC
+         LIMIT 1",
+    )
+    .bind(AUDIT_CANONICAL_VERSION_V2)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let last_entry_hash: String = row.try_get("entry_hash")?;
+    let sealed_at = Utc::now().to_rfc3339();
+    let seal = signer.sign_legacy_audit_seal(&last_entry_hash, &sealed_at)?;
+    sqlx::query(
+        "INSERT INTO audit_legacy_seals
+             (id, last_entry_hash, sealed_at, seal_sig_b64, seal_ml_dsa_alg, seal_ml_dsa_sig_b64)
+         VALUES ('legacy-v1', $1, $2, $3, $4, $5)",
+    )
+    .bind(&last_entry_hash)
+    .bind(&sealed_at)
+    .bind(&seal.ed25519_sig_b64)
+    .bind(&seal.ml_dsa_alg)
+    .bind(&seal.ml_dsa_sig_b64)
+    .execute(pool)
+    .await?;
+    tracing::warn!(
+        last_entry_hash = %last_entry_hash,
+        "sealed legacy unsigned audit rows; migrate or archive them when practical"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Audit ingest (the "who, what, when, where" ledger)
 // ---------------------------------------------------------------------------
@@ -1341,32 +1503,50 @@ pub async fn ingest_audit(
         let now = Utc::now().to_rfc3339();
         let flags_json = serde_json::to_string(&e.injection_flags).map_err(err500)?;
         let id = Uuid::new_v4().to_string();
+        let seq = tail.seq + 1;
 
-        let canonical = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            tail,
-            now,
-            e.gateway_id,
-            e.agent_session_id.as_deref().unwrap_or(""),
-            principal.0,
-            e.server_id,
-            e.tool_name,
-            e.decision,
-            e.args_fingerprint,
-            flags_json,
-            e.result_bytes.unwrap_or(-1)
+        let entry_hash = audit_entry_hash_v2(AuditHashFields {
+            seq,
+            prev_hash: &tail.hash,
+            ts: &now,
+            gateway_id: &e.gateway_id,
+            agent_session_id: e.agent_session_id.as_deref(),
+            principal_id: &principal.0,
+            server_id: &e.server_id,
+            tool_name: &e.tool_name,
+            decision: &e.decision,
+            args_fingerprint: &e.args_fingerprint,
+            injection_flags: &flags_json,
+            result_bytes: e.result_bytes,
+        });
+        let checkpoint_signed_at = now.clone();
+        let checkpoint = state
+            .signer
+            .sign_audit_checkpoint(
+                seq,
+                &entry_hash,
+                &checkpoint_signed_at,
+                audit_requires_ml_dsa_checkpoint(seq, state.audit_ml_dsa_checkpoint_interval),
+            )
+            .map_err(err500)?;
+        let anchor_record = AuditAnchorRecord::new(
+            seq,
+            entry_hash.clone(),
+            checkpoint_signed_at.clone(),
+            &checkpoint,
         );
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        let entry_hash = format!("{:x}", hasher.finalize());
 
         sqlx::query(
             "INSERT INTO audit_events
-                 (id, ts, gateway_id, agent_session_id, principal_id, server_id, tool_name,
-                  decision, args_fingerprint, injection_flags, result_bytes, prev_hash, entry_hash)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                 (id, seq, canonical_version, ts, gateway_id, agent_session_id, principal_id,
+                  server_id, tool_name, decision, args_fingerprint, injection_flags, result_bytes,
+                  prev_hash, entry_hash, checkpoint_signed_at, checkpoint_sig_b64,
+                  checkpoint_ml_dsa_alg, checkpoint_ml_dsa_sig_b64)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(&id)
+        .bind(seq)
+        .bind(AUDIT_CANONICAL_VERSION_V2)
         .bind(&now)
         .bind(&e.gateway_id)
         .bind(&e.agent_session_id)
@@ -1377,13 +1557,33 @@ pub async fn ingest_audit(
         .bind(&e.args_fingerprint)
         .bind(&flags_json)
         .bind(e.result_bytes)
-        .bind(&tail)
+        .bind(&tail.hash)
         .bind(&entry_hash)
+        .bind(&checkpoint_signed_at)
+        .bind(&checkpoint.ed25519_sig_b64)
+        .bind(&checkpoint.ml_dsa_alg)
+        .bind(&checkpoint.ml_dsa_sig_b64)
         .execute(&state.pool)
         .await
         .map_err(err500)?;
 
-        tail = entry_hash;
+        tail = AuditChainTail {
+            seq,
+            hash: entry_hash,
+        };
+        if let Err(e) = state.audit_anchor.publish(&anchor_record) {
+            *tail_guard = tail.clone();
+            if state.audit_anchor.required() {
+                return Err(err500(format!(
+                    "required audit anchor publish failed after seq {seq}: {e}"
+                )));
+            }
+            tracing::warn!(
+                seq,
+                error = %e,
+                "audit anchor publish failed; database row is still signed but rollback detection may lag"
+            );
+        }
     }
 
     *tail_guard = tail;
@@ -1395,21 +1595,70 @@ pub async fn ingest_audit(
 /// This is the entire point of hash-chaining - if you never call this, the
 /// chain is just extra columns.
 pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let rows = match sqlx::query(
-        "SELECT id, ts, gateway_id, agent_session_id, principal_id, server_id, tool_name, \
-                decision, args_fingerprint, injection_flags, result_bytes, prev_hash, entry_hash \
-         FROM audit_events ORDER BY ts ASC",
-    )
-    .fetch_all(&state.pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    let latest_anchor = match state.audit_anchor.latest() {
+        Ok(anchor) => anchor,
+        Err(e) if state.audit_anchor.required() => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "failed to read required audit anchor",
+                "error": e.to_string()
+            }))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read optional audit anchor");
+            None
+        }
     };
+    if let Some(anchor) = &latest_anchor {
+        if let Err(e) = state.signer.verify_audit_checkpoint(
+            anchor.seq,
+            &anchor.entry_hash,
+            &anchor.checkpoint_signed_at,
+            AuditSignatureParts {
+                ed25519_sig_b64: &anchor.checkpoint_sig_b64,
+                ml_dsa_alg: anchor.checkpoint_ml_dsa_alg.as_deref(),
+                ml_dsa_sig_b64: anchor.checkpoint_ml_dsa_sig_b64.as_deref(),
+                require_ml_dsa: audit_requires_ml_dsa_checkpoint(
+                    anchor.seq,
+                    state.audit_ml_dsa_checkpoint_interval,
+                ),
+            },
+        ) {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "latest audit anchor signature does not verify",
+                "error": e.to_string()
+            }));
+        }
+    }
 
     let mut expected_prev = GENESIS_HASH.to_string();
+    let mut expected_next_seq: Option<i64> = None;
+    let mut checked_rows: i64 = 0;
+    let mut signed_checkpoints: i64 = 0;
+    let mut legacy_unsigned_rows: i64 = 0;
+    let mut last_legacy_hash: Option<String> = None;
+    let mut anchor_matched_row = latest_anchor.is_none();
+    let mut rows = sqlx::query(
+        "SELECT id, seq, canonical_version, ts, gateway_id, agent_session_id, principal_id,
+                server_id, tool_name, decision, args_fingerprint, injection_flags, result_bytes,
+                prev_hash, entry_hash, checkpoint_signed_at, checkpoint_sig_b64,
+                checkpoint_ml_dsa_alg, checkpoint_ml_dsa_sig_b64
+         FROM audit_events
+         ORDER BY CASE WHEN seq IS NULL THEN 0 ELSE 1 END, seq ASC, ts ASC",
+    )
+    .fetch(&state.pool);
 
-    for r in rows {
+    while let Some(r) = match rows.try_next().await {
+        Ok(row) => row,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "failed to stream audit rows",
+                "error": e.to_string()
+            }))
+        }
+    } {
         let id: String = match r.try_get("id") {
             Ok(value) => value,
             Err(e) => {
@@ -1427,6 +1676,14 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 "reason": format!("audit row has an invalid {column} column"),
                 "error": error.to_string()
             }))
+        };
+        let seq: Option<i64> = match r.try_get("seq") {
+            Ok(value) => value,
+            Err(e) => return decode_error("seq", e),
+        };
+        let canonical_version: i64 = match r.try_get("canonical_version") {
+            Ok(value) => value,
+            Err(e) => return decode_error("canonical_version", e),
         };
         let ts: String = match r.try_get("ts") {
             Ok(value) => value,
@@ -1476,6 +1733,25 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             Ok(value) => value,
             Err(e) => return decode_error("entry_hash", e),
         };
+        let checkpoint_signed_at: Option<String> = match r.try_get("checkpoint_signed_at") {
+            Ok(value) => value,
+            Err(e) => return decode_error("checkpoint_signed_at", e),
+        };
+        let checkpoint_sig_b64: Option<String> = match r.try_get("checkpoint_sig_b64") {
+            Ok(value) => value,
+            Err(e) => return decode_error("checkpoint_sig_b64", e),
+        };
+        let checkpoint_ml_dsa_alg: Option<String> = match r.try_get("checkpoint_ml_dsa_alg") {
+            Ok(value) => value,
+            Err(e) => return decode_error("checkpoint_ml_dsa_alg", e),
+        };
+        let checkpoint_ml_dsa_sig_b64: Option<String> = match r.try_get("checkpoint_ml_dsa_sig_b64")
+        {
+            Ok(value) => value,
+            Err(e) => return decode_error("checkpoint_ml_dsa_sig_b64", e),
+        };
+
+        checked_rows += 1;
 
         // Check 1: does this row's stored prev_hash actually match the
         // previous row's entry_hash? This is the check the original version
@@ -1492,23 +1768,56 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
         }
 
         // Check 2: does this row's own entry_hash actually match its content?
-        let canonical = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            prev_hash,
-            ts,
-            gateway_id,
-            agent_session_id.as_deref().unwrap_or(""),
-            principal_id,
-            server_id,
-            tool_name,
-            decision,
-            args_fingerprint,
-            injection_flags,
-            result_bytes.unwrap_or(-1)
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        let recomputed = format!("{:x}", hasher.finalize());
+        let recomputed = if canonical_version >= AUDIT_CANONICAL_VERSION_V2 {
+            let Some(seq) = seq else {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "broken_at_id": id,
+                    "reason": "v2 audit row is missing sequence number"
+                }));
+            };
+            if let Some(expected) = expected_next_seq {
+                if seq != expected {
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "broken_at_id": id,
+                        "reason": "audit sequence is not contiguous"
+                    }));
+                }
+            }
+            expected_next_seq = Some(seq + 1);
+            audit_entry_hash_v2(AuditHashFields {
+                seq,
+                prev_hash: &prev_hash,
+                ts: &ts,
+                gateway_id: &gateway_id,
+                agent_session_id: agent_session_id.as_deref(),
+                principal_id: &principal_id,
+                server_id: &server_id,
+                tool_name: &tool_name,
+                decision: &decision,
+                args_fingerprint: &args_fingerprint,
+                injection_flags: &injection_flags,
+                result_bytes,
+            })
+        } else {
+            legacy_unsigned_rows += 1;
+            last_legacy_hash = Some(entry_hash.clone());
+            legacy_audit_entry_hash(AuditHashFields {
+                seq: seq.unwrap_or_default(),
+                prev_hash: &prev_hash,
+                ts: &ts,
+                gateway_id: &gateway_id,
+                agent_session_id: agent_session_id.as_deref(),
+                principal_id: &principal_id,
+                server_id: &server_id,
+                tool_name: &tool_name,
+                decision: &decision,
+                args_fingerprint: &args_fingerprint,
+                injection_flags: &injection_flags,
+                result_bytes,
+            })
+        };
 
         if recomputed != entry_hash {
             return Json(serde_json::json!({
@@ -1518,9 +1827,214 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             }));
         }
 
+        if canonical_version >= AUDIT_CANONICAL_VERSION_V2 {
+            let Some(seq) = seq else {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "broken_at_id": id,
+                    "reason": "v2 audit row is missing sequence number"
+                }));
+            };
+            let Some(checkpoint_signed_at) = checkpoint_signed_at.as_deref() else {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "broken_at_id": id,
+                    "reason": "v2 audit row is missing signed checkpoint timestamp"
+                }));
+            };
+            let Some(checkpoint_sig_b64) = checkpoint_sig_b64.as_deref() else {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "broken_at_id": id,
+                    "reason": "v2 audit row is missing signed checkpoint"
+                }));
+            };
+            if let Err(e) = state.signer.verify_audit_checkpoint(
+                seq,
+                &entry_hash,
+                checkpoint_signed_at,
+                AuditSignatureParts {
+                    ed25519_sig_b64: checkpoint_sig_b64,
+                    ml_dsa_alg: checkpoint_ml_dsa_alg.as_deref(),
+                    ml_dsa_sig_b64: checkpoint_ml_dsa_sig_b64.as_deref(),
+                    require_ml_dsa: audit_requires_ml_dsa_checkpoint(
+                        seq,
+                        state.audit_ml_dsa_checkpoint_interval,
+                    ),
+                },
+            ) {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "broken_at_id": id,
+                    "reason": "audit checkpoint signature does not verify",
+                    "error": e.to_string()
+                }));
+            }
+            if let Some(anchor) = &latest_anchor {
+                if anchor.seq == seq {
+                    if anchor.entry_hash != entry_hash {
+                        return Json(serde_json::json!({
+                            "ok": false,
+                            "broken_at_id": id,
+                            "reason": "audit row hash does not match latest external anchor"
+                        }));
+                    }
+                    anchor_matched_row = true;
+                }
+            }
+            signed_checkpoints += 1;
+        }
+
         expected_prev = entry_hash;
     }
-    Json(serde_json::json!({ "ok": true }))
+    drop(rows);
+
+    let legacy_sealed = if let Some(last_hash) = last_legacy_hash.as_deref() {
+        let seal = match sqlx::query(
+            "SELECT last_entry_hash, sealed_at, seal_sig_b64, seal_ml_dsa_alg,
+                    seal_ml_dsa_sig_b64
+             FROM audit_legacy_seals
+             WHERE id = 'legacy-v1'",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "failed to read legacy audit seal",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        let Some(seal) = seal else {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "legacy unsigned audit rows exist but no signed legacy seal is present"
+            }));
+        };
+        let sealed_hash: String = match seal.try_get("last_entry_hash") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "legacy audit seal has invalid last_entry_hash",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        if sealed_hash != last_hash {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "legacy audit rows no longer match the signed legacy seal"
+            }));
+        }
+        let sealed_at: String = match seal.try_get("sealed_at") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "legacy audit seal has invalid sealed_at",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        let seal_sig_b64: String = match seal.try_get("seal_sig_b64") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "legacy audit seal has invalid seal_sig_b64",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        let seal_ml_dsa_alg: Option<String> = match seal.try_get("seal_ml_dsa_alg") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "legacy audit seal has invalid seal_ml_dsa_alg",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        let seal_ml_dsa_sig_b64: Option<String> = match seal.try_get("seal_ml_dsa_sig_b64") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "legacy audit seal has invalid seal_ml_dsa_sig_b64",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        if let Err(e) = state.signer.verify_legacy_audit_seal(
+            last_hash,
+            &sealed_at,
+            AuditSignatureParts {
+                ed25519_sig_b64: &seal_sig_b64,
+                ml_dsa_alg: seal_ml_dsa_alg.as_deref(),
+                ml_dsa_sig_b64: seal_ml_dsa_sig_b64.as_deref(),
+                require_ml_dsa: true,
+            },
+        ) {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "legacy audit seal signature does not verify",
+                "error": e.to_string()
+            }));
+        }
+        true
+    } else {
+        false
+    };
+
+    let last_seq = expected_next_seq.map(|seq| seq - 1).unwrap_or(0);
+    let anchor_status = if let Some(anchor) = &latest_anchor {
+        if !anchor_matched_row {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "audit database is missing the row recorded by the latest external anchor",
+                "anchor_seq": anchor.seq,
+                "db_last_seq": last_seq
+            }));
+        }
+        if state.audit_anchor.required()
+            && (anchor.seq != last_seq || anchor.entry_hash != expected_prev)
+        {
+            return Json(serde_json::json!({
+                "ok": false,
+                "reason": "required audit anchor does not match the current audit tail",
+                "anchor_seq": anchor.seq,
+                "db_last_seq": last_seq
+            }));
+        }
+        if anchor.seq == last_seq {
+            "matched"
+        } else {
+            "db_ahead_of_anchor"
+        }
+    } else if state.audit_anchor.required() {
+        return Json(serde_json::json!({
+            "ok": false,
+            "reason": "required audit anchor is missing"
+        }));
+    } else if state.audit_anchor.is_enabled() {
+        "missing"
+    } else {
+        "disabled"
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "checked_rows": checked_rows,
+        "signed_checkpoints": signed_checkpoints,
+        "legacy_unsigned_rows": legacy_unsigned_rows,
+        "legacy_sealed": legacy_sealed,
+        "audit_anchor": anchor_status
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1621,7 +2135,9 @@ pub async fn issue_token(
     }
 
     let now = Utc::now();
-    let exp = now + Duration::seconds(req.ttl_seconds.min(3600).max(30)); // clamp: 30s-1h
+    let exp = now + Duration::seconds(req.ttl_seconds.clamp(30, 3600));
+    let jti = Uuid::new_v4().to_string();
+    let aud = token_audience(&req.gateway_id, &req.server_id, &req.tool_name);
 
     let claims = TokenClaims {
         sub: spiffe_id,
@@ -1629,15 +2145,33 @@ pub async fn issue_token(
         cnf: crate::identity::ConfirmationClaim {
             ed25519_public_key_b64: public_key_b64,
         },
+        aud,
         server_id: req.server_id,
         tool_name: req.tool_name,
         gateway_id: req.gateway_id,
-        jti: Uuid::new_v4().to_string(),
+        jti: jti.clone(),
+        nbf: now.timestamp(),
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
 
     let token = state.signer.sign_token(&claims).map_err(err500)?;
+    sqlx::query(
+        "INSERT INTO issued_tokens
+             (jti, agent_session_id, gateway_id, server_id, tool_name, issued_at, not_before, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&jti)
+    .bind(&req.agent_session_id)
+    .bind(&claims.gateway_id)
+    .bind(&claims.server_id)
+    .bind(&claims.tool_name)
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .bind(exp.to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(err500)?;
     Ok(Json(IssuedToken {
         token,
         expires_at: exp.to_rfc3339(),
@@ -1647,10 +2181,130 @@ pub async fn issue_token(
 pub async fn signer_public_key(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ed25519_public_key_b64": state.signer.ed25519_verifying_key_b64(),
+        "ed25519_kid": state.signer.ed25519_key_id(),
         "ml_dsa_alg": "ML-DSA-65",
         "ml_dsa_public_key_b64": state.signer.ml_dsa65_verifying_key_b64(),
+        "ml_dsa_kid": state.signer.ml_dsa65_key_id(),
         "hybrid_required_by_default": true
     }))
+}
+
+pub async fn introspect_token(
+    State(state): State<AppState>,
+    principal: AuthedPrincipal,
+    Json(req): Json<IntrospectTokenRequest>,
+) -> ApiResult<Json<IntrospectTokenResponse>> {
+    let claims = match state.signer.verify_token(&req.token, true) {
+        Ok(claims) => claims,
+        Err(e) => {
+            return Ok(Json(inactive_token_response(format!(
+                "token signature or claims failed verification: {e}"
+            ))))
+        }
+    };
+
+    ensure_gateway_owner(&state, &principal, &claims.gateway_id).await?;
+    let Some(agent_session_id) = agent_session_id_from_spiffe(&claims.sub) else {
+        return Ok(Json(inactive_token_response(
+            "token subject is not a recognized agent SPIFFE ID",
+        )));
+    };
+    let now = Utc::now();
+    let now_rfc3339 = now.to_rfc3339();
+    let Some(token_row) = sqlx::query(
+        "SELECT used_at, expires_at
+         FROM issued_tokens
+         WHERE jti = $1 AND agent_session_id = $2 AND gateway_id = $3
+           AND server_id = $4 AND tool_name = $5",
+    )
+    .bind(&claims.jti)
+    .bind(&agent_session_id)
+    .bind(&claims.gateway_id)
+    .bind(&claims.server_id)
+    .bind(&claims.tool_name)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(err500)?
+    else {
+        return Ok(Json(inactive_token_response(
+            "token id was not issued by this control plane",
+        )));
+    };
+    let used_at: Option<String> = token_row.try_get("used_at").ok().flatten();
+    if used_at.is_some() {
+        return Ok(Json(inactive_token_response("token id was already used")));
+    }
+    let expires_at: String = token_row.try_get("expires_at").map_err(err500)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).map_err(err500)?;
+    if expires_at < now {
+        return Ok(Json(inactive_token_response("token id is expired")));
+    }
+
+    let Some(session_row) = sqlx::query(
+        "SELECT principal_id, expires_at, revoked_at
+         FROM agent_sessions
+         WHERE id = $1",
+    )
+    .bind(&agent_session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(err500)?
+    else {
+        return Ok(Json(inactive_token_response(
+            "agent session no longer exists",
+        )));
+    };
+    let principal_id: String = session_row.try_get("principal_id").map_err(err500)?;
+    if principal_id != claims.act.sub {
+        return Ok(Json(inactive_token_response(
+            "token actor does not match agent session owner",
+        )));
+    }
+    let session_revoked_at: Option<String> = session_row.try_get("revoked_at").ok().flatten();
+    if session_revoked_at.is_some() {
+        return Ok(Json(inactive_token_response("agent session is revoked")));
+    }
+    let session_expires_at: String = session_row.try_get("expires_at").map_err(err500)?;
+    let session_expires_at =
+        chrono::DateTime::parse_from_rfc3339(&session_expires_at).map_err(err500)?;
+    if session_expires_at < now {
+        return Ok(Json(inactive_token_response("agent session is expired")));
+    }
+
+    let result =
+        sqlx::query("UPDATE issued_tokens SET used_at = $1 WHERE jti = $2 AND used_at IS NULL")
+            .bind(&now_rfc3339)
+            .bind(&claims.jti)
+            .execute(&state.pool)
+            .await
+            .map_err(err500)?;
+    if result.rows_affected() == 0 {
+        return Ok(Json(inactive_token_response("token id was already used")));
+    }
+
+    Ok(Json(IntrospectTokenResponse {
+        active: true,
+        agent_session_id: Some(agent_session_id),
+        principal_id: Some(claims.act.sub),
+        gateway_id: Some(claims.gateway_id),
+        server_id: Some(claims.server_id),
+        tool_name: Some(claims.tool_name),
+        jti: Some(claims.jti),
+        reason: None,
+    }))
+}
+
+fn inactive_token_response(reason: impl Into<String>) -> IntrospectTokenResponse {
+    IntrospectTokenResponse {
+        active: false,
+        agent_session_id: None,
+        principal_id: None,
+        gateway_id: None,
+        server_id: None,
+        tool_name: None,
+        jti: None,
+        reason: Some(reason.into()),
+    }
 }
 
 pub async fn revoke_agent_session(

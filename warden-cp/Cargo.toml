@@ -3,6 +3,7 @@ name = "warden-cp"
 version = "0.1.0"
 edition = "2021"
 description = "Control plane for mcp-warden: inventory, allowlists/drift, scoped identity, audit + approvals"
+license = "Apache-2.0"
 
 [features]
 default = ["sqlite"]
@@ -30,3 +31,5 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 regorus = { version = "0.10.1", default-features = false, features = ["opa-no-std"] }
 jsonwebtoken = "10.3"
+futures-util = "0.3"
+wait-timeout = "0.2"

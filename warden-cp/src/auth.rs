@@ -3,6 +3,8 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -15,6 +17,12 @@ pub fn hash_key(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+pub fn random_bearer_token(prefix: &str) -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Resolved caller identity, available to any handler via the
@@ -137,7 +145,7 @@ pub async fn bootstrap_root_key_if_needed(pool: &DbPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    let raw_key = format!("warden_root_{}", Uuid::new_v4().simple());
+    let raw_key = random_bearer_token("warden_root");
     let key_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO api_keys (id, principal_id, key_hash, created_at) VALUES ($1, $2, $3, $4)",

@@ -1,6 +1,7 @@
 use crate::config::UpstreamConfig;
 use anyhow::Result;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
@@ -8,6 +9,18 @@ use std::time::Duration;
 pub struct SignerPublicKeys {
     pub ed25519_public_key_b64: String,
     pub ml_dsa_public_key_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenIntrospection {
+    pub active: bool,
+    pub agent_session_id: Option<String>,
+    pub principal_id: Option<String>,
+    pub gateway_id: Option<String>,
+    pub server_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub jti: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -162,6 +175,20 @@ impl CpClient {
             ed25519_public_key_b64,
             ml_dsa_public_key_b64,
         })
+    }
+
+    pub async fn introspect_token(&self, token: &str) -> Result<TokenIntrospection> {
+        let body = json!({ "token": token });
+        let resp = self
+            .authed(
+                self.http
+                    .post(format!("{}/v1/token/introspect", self.base_url)),
+            )
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
     }
 
     pub async fn create_approval(

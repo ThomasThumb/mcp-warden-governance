@@ -32,19 +32,19 @@ What's real and implemented:
   and policy overlays, submits audit events, routes approvals through
   `warden-cp`, and verifies short-lived per-call agent tokens before any
   upstream tool call is made.
+- **Remote HTTP upstreams** - JSON-RPC-over-HTTP POST upstreams are supported
+  with static env-backed bearer tokens or OAuth client credentials using an
+  RFC 8707 `resource` indicator.
+- **Local stdio sandbox wrappers** - `bubblewrap`, `firejail`, and Docker
+  wrapper modes are available for stdio servers; missing wrappers fail closed
+  at startup instead of silently running unsandboxed.
 
 What's explicitly NOT done yet (see "Roadmap" below), on purpose rather than
 by accident:
-- **Remote/HTTP upstream servers.** Config schema supports declaring them;
-  `upstream.rs` stubs the connection and explains what OAuth 2.1 broker logic
-  needs to go there. Wiring this in wrong is worse than not having it, so it's
-  left as a clearly marked TODO rather than guessed at.
-- **Process sandboxing for local servers.** Right now a stdio server runs
-  with whatever permissions your user account has. Landlock (Linux, pure
-  Rust, no external binary) or bubblewrap are the next thing to bolt on - see
-  Roadmap.
 - **A polished approval UX.** The control-plane approval API is real; a thin
   dashboard, Slack app, or CLI watcher is still the next usability layer.
+- **Native SPIRE/SVID issuance.** Agent session IDs are already SPIFFE-shaped,
+  but `warden-cp` still mints them locally until real SPIRE integration lands.
 
 ## Why it's architected this way
 
@@ -56,7 +56,7 @@ MCP Top 10 / NSA guidance:
 | Tool poisoning / rug pulls | `integrity.rs` hash pinning |
 | Prompt injection (direct + indirect) | `injection_filter.rs`, applied to both tool defs and results |
 | Privilege creep / over-broad scopes | `policy.rs` default-deny, per-tool risk tiers |
-| Token passthrough / confused deputy | `upstream.rs` - the gateway is the OAuth client, never the host's raw token (once HTTP is wired up) |
+| Token passthrough / confused deputy | `upstream.rs` - the gateway is the OAuth client, never the host's raw token |
 | Cross-server tool shadowing | namespacing in `gateway.rs::list_tools` |
 | Silent behavior drift | audit log + integrity guard together give you a paper trail |
 
@@ -115,6 +115,10 @@ cargo check         # fix whatever it flags per the table above
 cargo build --release
 ```
 
+Supply-chain CI and release provenance are documented in the repository root
+`SUPPLY_CHAIN.md`. Release binaries should be verified with GitHub artifact
+attestations before deployment.
+
 Point your MCP host at the binary instead of your real servers:
 
 ```json
@@ -152,6 +156,8 @@ If `[control_plane]` is set in `warden.toml`, this gateway now:
 7. Requires the token envelope's Ed25519 and ML-DSA-65 signatures by default
 8. Verifies a proof-of-possession signature from the agent-session key when
    `require_agent_proof = true`, so a stolen token alone is not enough
+9. Calls `/v1/token/introspect` by default before forwarding the call, so
+   revoked sessions and already-used token IDs fail closed online
 
 ```toml
 [control_plane]
@@ -164,7 +170,13 @@ ml_dsa_public_key_b64 = "optional-if-control-plane-is-reachable-at-startup"
 require_ml_dsa_token_signature = true
 require_agent_token = true
 require_agent_proof = true
+require_token_introspection = true
 ```
+
+`require_agent_proof = true` now requires `require_token_introspection = true`.
+That is intentional: a proof over `token + args_fingerprint` is replayable if
+the token id is not consumed online. Fetch a fresh token for each retry instead
+of replaying the same `(token, proof, args)` tuple.
 
 ```bash
 # control plane down / network partition / whatever:
@@ -235,6 +247,9 @@ accepted and stripped before the upstream server receives the call. A token is
 not a general session bearer: it must match the configured gateway, the
 upstream server id, and the exact tool name. Missing, expired, or mis-scoped
 tokens are denied and audited before the upstream server is touched.
+By default, cryptographic verification is followed by online control-plane
+introspection. That marks the token ID as used and prevents a captured token
+from being replayed against a second call.
 
 When proof-of-possession is enabled, the call must also include
 `_meta.warden_proof` or `arguments.__warden_proof`. The value is a base64
@@ -249,6 +264,9 @@ warden-pop-v1
 `args_fingerprint` is computed after `__warden_token` and `__warden_proof`
 are stripped, which prevents token/proof material from reaching the upstream
 tool or changing the policy/audit fingerprint.
+The proof key and proof signature may be encoded as standard base64 or
+URL-safe no-pad base64; the verifier accepts both so agents can use the same
+encoding convention as the token envelope.
 
 ## Remote HTTP upstreams
 
@@ -354,15 +372,14 @@ nullclaw contributors. See `THIRD_PARTY_NOTICES.md`.
 
 ## Roadmap (in the order I'd tackle them)
 
-1. **Remote HTTP upstreams with a real OAuth 2.1 broker** - resource
-   indicators (RFC 8707) so a token minted for one upstream can't be replayed
-   against another, and the gateway (not the host) holds the credential.
-2. **Sandbox local stdio servers** - Landlock (`landlock` crate, pure Rust,
-   Linux-only) for filesystem/network restriction without shelling out;
-   bubblewrap as a heavier fallback for non-Landlock kernels.
-3. **A real approval UI** - the API queue exists; build a dashboard, Slack
+1. **A real approval UI** - the API queue exists; build a dashboard, Slack
    app, or CLI watcher on top so interactive use doesn't mean babysitting a
    second terminal.
+2. **SPIRE/SVID integration** - replace locally minted SPIFFE-shaped IDs with
+   real workload identity while keeping the existing `spiffe_id` data model.
+3. **Sandbox profile hardening** - turn the current host-tool wrappers into
+   reviewed per-upstream profiles and add Landlock where Linux deployments can
+   use it.
 4. **Anomaly detection** - rate limiting per tool/server, alerting on
    dormant-tool reactivation and oversized responses (possible exfil), along
    the lines of the SIEM-style rules described in the audit log.

@@ -314,8 +314,8 @@ async fn verify_id_token(
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("bad RSA JWK: {e}")))?;
 
     let mut validation = Validation::new(alg);
-    validation.set_audience(&[cfg.client_id.clone()]);
-    validation.set_issuer(&[discovery.issuer.clone()]);
+    validation.set_audience(std::slice::from_ref(&cfg.client_id));
+    validation.set_issuer(std::slice::from_ref(&discovery.issuer));
     let data = decode::<Claims>(id_token, &key, &validation).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
@@ -505,7 +505,7 @@ async fn create_session(
     principal_id: &str,
     ttl_hours: i64,
 ) -> ApiResult<(String, String)> {
-    let token = format!("warden_session_{}", Uuid::new_v4().simple());
+    let token = auth::random_bearer_token("warden_session");
     let now = Utc::now();
     let expires = now + Duration::hours(ttl_hours);
     sqlx::query(
@@ -577,7 +577,7 @@ fn pkce_challenge(verifier: &str) -> String {
 }
 
 fn random_url_token() -> String {
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+    auth::random_bearer_token("oidc")
 }
 
 fn required_env(name: &str) -> anyhow::Result<String> {

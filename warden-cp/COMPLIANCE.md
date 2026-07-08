@@ -29,7 +29,7 @@ period of time. What this build gives you evidence *for*:
 | Control area | What we have | What's still on you |
 |---|---|---|
 | Logical access (CC6-series) | Real API-key auth on every control-plane endpoint (`auth.rs`), per-agent-session scoped tokens, explicit revocation | Key rotation policy, offboarding process for departed employees' keys, MFA on however operators reach the box itself |
-| System monitoring (CC7-series) | Hash-chained audit log with a verify endpoint, rate limiting | Alerting/SIEM integration, an actual on-call process for what happens when `/v1/audit/verify` reports a break |
+| System monitoring (CC7-series) | Hash-chained audit log with signed checkpoints, external high-water anchoring via file or command adapter, a verify endpoint, and write-endpoint rate limiting | Alerting/SIEM integration, WORM/object-lock bucket provisioning for anchors, and an actual on-call process for what happens when `/v1/audit/verify` reports a break |
 | Change management | Versioned policy bundles and org-Rego policies (every change has a version, timestamp, and author) | A documented change-approval process around *who* is allowed to push a new policy version |
 | Risk mitigation | Default-deny policy floor, degraded-mode gate requiring explicit human confirmation | A written incident response plan; this codebase logs incidents, it doesn't run your response process |
 | Confidentiality | Signing key persisted with restrictive file permissions, secrets never logged in plaintext (audit stores arg *hashes*) | Encryption at rest for the database itself, a real secrets vault for upstream server credentials (see mcp-warden's open gap) |
@@ -70,7 +70,8 @@ The most concretely actionable article for this specific system is
 It doesn't explicitly say "tamper-proof," but logs with no integrity
 guarantee carry little evidentiary weight if you ever need to show a
 regulator or auditor they weren't altered after the fact. That's the
-entire reason `audit_events` is hash-chained rather than a plain table -
+entire reason `audit_events` is hash-chained with signed checkpoints and can
+be anchored outside the database rather than stored as a plain table -
 `GET /v1/audit/verify` is the artifact you'd actually produce on request.
 
 Other articles this build's controls touch:
@@ -78,7 +79,7 @@ Other articles this build's controls touch:
 | Article | What it requires | What we have |
 |---|---|---|
 | Art. 9 (risk management) | Continuous risk management across the system's life | The floor/Rego layering + drift detection are ongoing controls, not a one-time assessment - but the *documented* risk management process is still yours to write |
-| Art. 12 (record-keeping) | Automatic logging over the system's lifetime | Hash-chained audit log, minimum 6-month retention is on you to configure (nothing here auto-deletes, but nothing enforces retention either - that's a deployment decision) |
+| Art. 12 (record-keeping) | Automatic logging over the system's lifetime | Hash-chained audit log with signed checkpoints and optional external high-water anchors, minimum 6-month retention is on you to configure (nothing here auto-deletes, but nothing enforces retention either - that's a deployment decision) |
 | Art. 14 (human oversight) | Humans can monitor and intervene | Default-to-approval, degraded-mode human gate, revocable agent sessions |
 | Art. 15 (cybersecurity / "action layer" resilience) | The APIs/tools an agent calls are explicitly in scope, not just the model | This is what `mcp-warden`'s entire injection-filter + policy-floor + integrity-hash stack is *for* - MCP tool calls are exactly the "action layer" the Act's recitals on multi-agent systems (Recitals 99-100) are describing |
 

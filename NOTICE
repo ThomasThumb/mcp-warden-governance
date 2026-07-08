@@ -1,0 +1,6 @@
+MCP Warden Governance
+Copyright 2026 MCP Warden contributors
+
+This product includes documentation references to NullClaw as an optional
+external agent runtime. NullClaw is MIT-licensed and is not vendored in this
+repository. See the component THIRD_PARTY_NOTICES.md files for attribution.

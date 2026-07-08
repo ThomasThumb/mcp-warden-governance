@@ -33,6 +33,11 @@ require_agent_token = true
 # signature by the agent-session key over:
 #   warden-pop-v1\n<token>\n<args_fingerprint>
 require_agent_proof = true
+# Zero-trust default. The gateway asks /v1/token/introspect before forwarding
+# each call, which enforces revocation and one-time token-id replay checks.
+# Required when require_agent_proof = true; otherwise the same proof can be
+# replayed with the same token and arguments until token expiry.
+require_token_introspection = true
 
 [injection_filter]
 scan_tool_descriptions = true
