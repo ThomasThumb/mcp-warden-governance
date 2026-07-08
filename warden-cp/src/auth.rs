@@ -56,15 +56,43 @@ pub async fn require_auth(
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     let key_hash = hash_key(token);
-    let row =
-        sqlx::query("SELECT principal_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL")
+    let row = sqlx::query(
+        "SELECT api_keys.principal_id as principal_id
+         FROM api_keys
+         JOIN principals ON principals.id = api_keys.principal_id
+         WHERE api_keys.key_hash = ?
+           AND api_keys.revoked_at IS NULL
+           AND principals.active = 1",
+    )
+    .bind(&key_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let now = chrono::Utc::now().to_rfc3339();
+            let session = sqlx::query(
+                "SELECT auth_sessions.principal_id as principal_id
+                 FROM auth_sessions
+                 JOIN principals ON principals.id = auth_sessions.principal_id
+                 WHERE auth_sessions.token_hash = ?
+                   AND auth_sessions.revoked_at IS NULL
+                   AND auth_sessions.expires_at > ?
+                   AND principals.active = 1",
+            )
             .bind(&key_hash)
+            .bind(&now)
             .fetch_optional(&state.pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let Some(row) = row else {
-        return Err(StatusCode::UNAUTHORIZED);
+            let Some(session) = session else {
+                return Err(StatusCode::UNAUTHORIZED);
+            };
+            session
+        }
     };
     let principal_id: String = row
         .try_get("principal_id")

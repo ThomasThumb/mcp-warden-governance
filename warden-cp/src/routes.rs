@@ -23,6 +23,7 @@ use sqlx::AnyPool;
 pub struct AppState {
     pub pool: AnyPool,
     pub signer: Arc<HybridSigner>,
+    pub oidc: Option<Arc<crate::oidc::OidcConfig>>,
     pub notifier: Arc<Notifier>,
     pub trust_domain: String,
     /// Tail of the audit hash chain, serialized through a mutex so
@@ -152,14 +153,35 @@ async fn ensure_session_owner(
     }
 }
 
+pub async fn principal_has_role(
+    state: &AppState,
+    principal: &AuthedPrincipal,
+    role: &str,
+) -> ApiResult<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM principal_roles
+         WHERE principal_id = ? AND role = ?
+         UNION
+         SELECT 1 FROM group_members
+         JOIN groups ON groups.id = group_members.group_id
+         JOIN group_roles ON group_roles.group_id = group_members.group_id
+         WHERE group_members.principal_id = ?
+           AND groups.active = 1
+           AND group_roles.role = ?
+         LIMIT 1",
+    )
+    .bind(&principal.0)
+    .bind(role)
+    .bind(&principal.0)
+    .bind(role)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(err500)?;
+    Ok(row.is_some())
+}
+
 async fn is_root_admin(state: &AppState, principal: &AuthedPrincipal) -> ApiResult<bool> {
-    let row =
-        sqlx::query("SELECT 1 FROM principal_roles WHERE principal_id = ? AND role = 'root_admin'")
-            .bind(&principal.0)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(err500)?;
-    if row.is_some() {
+    if principal_has_role(state, principal, "root_admin").await? {
         return Ok(true);
     }
 
@@ -180,6 +202,17 @@ async fn ensure_root_admin(state: &AppState, principal: &AuthedPrincipal) -> Api
     } else {
         Err(forbidden("root-admin API key required"))
     }
+}
+
+fn validate_roles(roles: &[String]) -> ApiResult<()> {
+    let allowed = ["root_admin", "security_admin", "gateway_owner"];
+    if roles.is_empty() || roles.iter().any(|role| !allowed.contains(&role.as_str())) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "roles must be one or more of root_admin, security_admin, gateway_owner".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +259,7 @@ pub async fn create_principal(
         kind: req.kind,
         display_name: display_name.to_string(),
         external_id: req.external_id,
+        active: true,
         created_at: now,
     }))
 }
@@ -236,7 +270,7 @@ pub async fn list_principals(
 ) -> ApiResult<Json<Vec<Principal>>> {
     ensure_root_admin(&state, &principal).await?;
     let rows = sqlx::query(
-        "SELECT id, kind, display_name, external_id, created_at
+        "SELECT id, kind, display_name, external_id, active, created_at
          FROM principals ORDER BY created_at DESC",
     )
     .fetch_all(&state.pool)
@@ -297,18 +331,7 @@ pub async fn set_principal_roles(
     Json(req): Json<SetPrincipalRolesRequest>,
 ) -> ApiResult<StatusCode> {
     ensure_root_admin(&state, &principal).await?;
-    let allowed = ["root_admin", "security_admin", "gateway_owner"];
-    if req.roles.is_empty()
-        || req
-            .roles
-            .iter()
-            .any(|role| !allowed.contains(&role.as_str()))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "roles must be one or more of root_admin, security_admin, gateway_owner".into(),
-        ));
-    }
+    validate_roles(&req.roles)?;
     let exists = sqlx::query("SELECT id FROM principals WHERE id = ?")
         .bind(&id)
         .fetch_optional(&state.pool)
@@ -333,6 +356,83 @@ pub async fn set_principal_roles(
             .map_err(err500)?;
     }
     Ok(StatusCode::OK)
+}
+
+pub async fn set_group_roles(
+    State(state): State<AppState>,
+    principal: AuthedPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<SetGroupRolesRequest>,
+) -> ApiResult<StatusCode> {
+    ensure_root_admin(&state, &principal).await?;
+    validate_roles(&req.roles)?;
+    let exists = sqlx::query("SELECT id FROM groups WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(err500)?
+        .is_some();
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "group not found".into()));
+    }
+
+    sqlx::query("DELETE FROM group_roles WHERE group_id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(err500)?;
+    for role in req.roles {
+        sqlx::query("INSERT INTO group_roles (group_id, role) VALUES (?, ?)")
+            .bind(&id)
+            .bind(role)
+            .execute(&state.pool)
+            .await
+            .map_err(err500)?;
+    }
+    Ok(StatusCode::OK)
+}
+
+pub async fn list_groups(
+    State(state): State<AppState>,
+    principal: AuthedPrincipal,
+) -> ApiResult<Json<Vec<GroupView>>> {
+    ensure_root_admin(&state, &principal).await?;
+    let rows = sqlx::query(
+        "SELECT groups.id, groups.display_name, groups.external_id, groups.active,
+                groups.created_at, COUNT(group_members.principal_id) as member_count
+         FROM groups
+         LEFT JOIN group_members ON group_members.group_id = groups.id
+         GROUP BY groups.id, groups.display_name, groups.external_id, groups.active, groups.created_at
+         ORDER BY groups.display_name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(err500)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let group_id: String = row.try_get("id").map_err(err500)?;
+        let role_rows =
+            sqlx::query("SELECT role FROM group_roles WHERE group_id = ? ORDER BY role")
+                .bind(&group_id)
+                .fetch_all(&state.pool)
+                .await
+                .map_err(err500)?;
+        let mut roles = Vec::with_capacity(role_rows.len());
+        for role in role_rows {
+            roles.push(role.try_get("role").map_err(err500)?);
+        }
+        out.push(GroupView {
+            id: group_id,
+            display_name: row.try_get("display_name").map_err(err500)?,
+            external_id: row.try_get("external_id").ok(),
+            active: row.try_get::<i64, _>("active").unwrap_or(1) != 0,
+            roles,
+            member_count: row.try_get("member_count").unwrap_or(0),
+            created_at: row.try_get("created_at").map_err(err500)?,
+        });
+    }
+    Ok(Json(out))
 }
 
 pub async fn revoke_api_key(
@@ -366,6 +466,7 @@ fn row_to_principal(r: &sqlx::any::AnyRow) -> anyhow::Result<Principal> {
         kind: r.try_get("kind")?,
         display_name: r.try_get("display_name")?,
         external_id: r.try_get("external_id").ok(),
+        active: r.try_get::<i64, _>("active").unwrap_or(1) != 0,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -1491,7 +1592,12 @@ pub async fn issue_token(
 }
 
 pub async fn signer_public_key(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ed25519_public_key_b64": state.signer.verifying_key_b64() }))
+    Json(serde_json::json!({
+        "ed25519_public_key_b64": state.signer.ed25519_verifying_key_b64(),
+        "ml_dsa_alg": "ML-DSA-65",
+        "ml_dsa_public_key_b64": state.signer.ml_dsa65_verifying_key_b64(),
+        "hybrid_required_by_default": true
+    }))
 }
 
 pub async fn revoke_agent_session(

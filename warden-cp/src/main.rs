@@ -3,7 +3,9 @@ mod db;
 mod identity;
 mod models;
 mod notify;
+mod oidc;
 mod routes;
+mod scim;
 
 use axum::middleware;
 use axum::routing::{get, post, put};
@@ -42,21 +44,33 @@ async fn main() -> anyhow::Result<()> {
     let signing_key_path = PathBuf::from(
         std::env::var("SIGNING_KEY_PATH").unwrap_or_else(|_| "warden-cp-signing.key".to_string()),
     );
+    let ml_dsa_key_path = PathBuf::from(
+        std::env::var("ML_DSA_SIGNING_KEY_PATH")
+            .unwrap_or_else(|_| "warden-cp-ml-dsa65.key".to_string()),
+    );
 
     let pool = db::connect(&database_url).await?;
     auth::bootstrap_root_key_if_needed(&pool).await?;
 
-    let signer = Arc::new(identity::HybridSigner::load_or_generate(&signing_key_path)?);
+    let signer = Arc::new(identity::HybridSigner::load_or_generate(
+        &signing_key_path,
+        Some(&ml_dsa_key_path),
+    )?);
     tracing::info!(
-        "signer public key (share with gateways for offline token verification): {}",
-        signer.verifying_key_b64()
+        "Ed25519 signer public key (share with gateways for offline token verification): {}",
+        signer.ed25519_verifying_key_b64()
     );
+    if let Some(key) = signer.ml_dsa65_verifying_key_b64() {
+        tracing::info!("ML-DSA-65 signer public key: {key}");
+    }
 
     let chain_tail = load_chain_tail(&pool).await;
+    let oidc = oidc::OidcConfig::from_env()?.map(Arc::new);
 
     let state = AppState {
         pool,
         signer,
+        oidc,
         notifier: Arc::new(notify::Notifier::new(webhook_url)),
         trust_domain,
         audit_chain_tail: Arc::new(AsyncMutex::new(chain_tail)),
@@ -70,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
             get(routes::list_principals).post(routes::create_principal),
         )
         .route("/v1/principals/:id/roles", put(routes::set_principal_roles))
+        .route("/v1/groups", get(routes::list_groups))
+        .route("/v1/groups/:id/roles", put(routes::set_group_roles))
         .route("/v1/api-keys", post(routes::create_api_key))
         .route("/v1/api-keys/:id/revoke", post(routes::revoke_api_key))
         .route("/v1/gateways", get(routes::list_gateways))
@@ -109,6 +125,33 @@ async fn main() -> anyhow::Result<()> {
             "/v1/org-policy/:scope",
             put(routes::set_org_policy).get(routes::get_org_policy),
         )
+        .route(
+            "/scim/v2/ServiceProviderConfig",
+            get(scim::service_provider_config),
+        )
+        .route("/scim/v2/Schemas", get(scim::schemas))
+        .route(
+            "/scim/v2/Users",
+            get(scim::list_users).post(scim::create_user),
+        )
+        .route(
+            "/scim/v2/Users/:id",
+            get(scim::get_user)
+                .put(scim::replace_user)
+                .patch(scim::patch_user)
+                .delete(scim::delete_user),
+        )
+        .route(
+            "/scim/v2/Groups",
+            get(scim::list_groups).post(scim::create_group),
+        )
+        .route(
+            "/scim/v2/Groups/:id",
+            get(scim::get_group)
+                .put(scim::replace_group)
+                .patch(scim::patch_group)
+                .delete(scim::delete_group),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             routes::rate_limit,
@@ -123,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/admin", get(routes::admin_dashboard))
+        .route("/oidc/login", get(oidc::login))
+        .route("/oidc/callback", get(oidc::callback))
         .merge(protected)
         .with_state(state);
 

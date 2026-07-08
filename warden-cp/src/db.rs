@@ -34,5 +34,20 @@ async fn apply_schema(pool: &AnyPool) -> anyhow::Result<()> {
         }
         sqlx::query(trimmed).execute(pool).await?;
     }
+    ensure_columns(pool).await?;
+    Ok(())
+}
+
+async fn ensure_columns(pool: &AnyPool) -> anyhow::Result<()> {
+    if sqlx::query("SELECT active FROM principals LIMIT 1")
+        .execute(pool)
+        .await
+        .is_err()
+    {
+        sqlx::query("ALTER TABLE principals ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await?;
+    }
+
     Ok(())
 }

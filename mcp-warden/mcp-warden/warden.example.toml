@@ -20,6 +20,12 @@ max_degraded_minutes = 60
 # Optional if the control plane is reachable at startup; the gateway will fetch
 # /v1/signer/public-key. Set it explicitly for degraded/offline verification.
 signer_public_key_b64 = "paste-ed25519-public-key-from-warden-cp"
+# Optional if the control plane is reachable at startup; required by default
+# for degraded/offline verification once hybrid token signing is enabled.
+ml_dsa_public_key_b64 = "paste-ml-dsa-65-public-key-from-warden-cp"
+# Zero-trust default for new deployments. Set false only as a temporary
+# migration bridge for older control planes that cannot issue hybrid envelopes.
+require_ml_dsa_token_signature = true
 # Zero-trust default. Every tools/call must carry a scoped token in
 # _meta.warden_token, or arguments.__warden_token for older clients.
 require_agent_token = true

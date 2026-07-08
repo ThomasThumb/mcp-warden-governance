@@ -149,7 +149,8 @@ If `[control_plane]` is set in `warden.toml`, this gateway now:
    audit events to `/v1/audit` alongside the local JSONL log
 6. Verifies every `tools/call` against a short-lived token scoped to exactly
    one `(gateway_id, server_id, tool_name)` before calling upstream
-7. Verifies a proof-of-possession signature from the agent-session key when
+7. Requires the token envelope's Ed25519 and ML-DSA-65 signatures by default
+8. Verifies a proof-of-possession signature from the agent-session key when
    `require_agent_proof = true`, so a stolen token alone is not enough
 
 ```toml
@@ -159,6 +160,8 @@ gateway_id = "laptop-jane"
 owner_principal_id = "principal-uuid-here"
 max_degraded_minutes = 60   # just documents the default you'd pass to confirm-degraded
 signer_public_key_b64 = "optional-if-control-plane-is-reachable-at-startup"
+ml_dsa_public_key_b64 = "optional-if-control-plane-is-reachable-at-startup"
+require_ml_dsa_token_signature = true
 require_agent_token = true
 require_agent_proof = true
 ```
@@ -301,13 +304,13 @@ for local dev only; across machines, put `warden-cp` behind TLS 1.3 and
 prefer a stack/provider that supports hybrid classical + ML-KEM key
 establishment.
 
-The per-call tokens here are signed with Ed25519 today. That is practical,
-fast, and widely reviewed, but it is not a post-quantum signature. The correct
-next step is hybrid signatures: keep Ed25519 and add NIST ML-DSA (FIPS 204)
-verification as a second required signature once the Rust implementation and
-side-channel posture are mature enough to depend on. Symmetric encryption
-should stay boring and strong: AES-256-GCM or ChaCha20-Poly1305 through a
-trusted TLS/AEAD library, not custom crypto.
+The per-call tokens are hybrid signed: Ed25519 remains the mature classical
+anchor, and ML-DSA-65 adds the FIPS 204 post-quantum signature. New gateway
+configs require both signatures by default when a control plane is configured.
+Set `require_ml_dsa_token_signature = false` only as a temporary migration
+bridge for an older control plane. Symmetric encryption should stay boring
+and strong: AES-256-GCM or ChaCha20-Poly1305 through a trusted TLS/AEAD
+library, not custom crypto.
 
 ## Org-customizable policy (new)
 

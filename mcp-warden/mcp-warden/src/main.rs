@@ -124,11 +124,23 @@ async fn main() -> anyhow::Result<()> {
                 match reachable {
                     Ok(()) => {
                         tracing::info!("registered with control plane at {}", cp_cfg.url);
-                        if cp_cfg.signer_public_key_b64.is_none() {
+                        if cp_cfg.signer_public_key_b64.is_none()
+                            || (cp_cfg.require_ml_dsa_token_signature
+                                && cp_cfg.ml_dsa_public_key_b64.is_none())
+                        {
                             match client.fetch_signer_public_key().await {
-                                Ok(key) => {
+                                Ok(keys) => {
                                     if let Some(cfg) = config.control_plane.as_mut() {
-                                        cfg.signer_public_key_b64 = Some(key);
+                                        cfg.signer_public_key_b64 =
+                                            Some(keys.ed25519_public_key_b64);
+                                        cfg.ml_dsa_public_key_b64 = keys.ml_dsa_public_key_b64;
+                                        if cfg.require_ml_dsa_token_signature
+                                            && cfg.ml_dsa_public_key_b64.is_none()
+                                        {
+                                            anyhow::bail!(
+                                                "control plane did not return an ML-DSA public key"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) if cp_cfg.require_agent_token => {

@@ -12,7 +12,7 @@ tokio = { version = "1", features = ["full"] }
 # trades sqlx's compile-time query! checking for that portability. See
 # README "Storage" for the tradeoff and how to move to a backend-specific
 # pool later if you want the compile-time checking back.
-sqlx = { version = "0.8", features = ["runtime-tokio", "any", "sqlite", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -23,8 +23,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 # Classical signing now; see src/identity.rs for the ML-DSA (PQC) hybrid slot.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+ml-dsa = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 rand = "0.8"
 base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 regorus = { version = "0.10.1", default-features = false, features = ["opa-no-std"] }
+jsonwebtoken = "9"

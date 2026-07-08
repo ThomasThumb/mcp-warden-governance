@@ -4,6 +4,12 @@ use reqwest::StatusCode;
 use serde_json::json;
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
+pub struct SignerPublicKeys {
+    pub ed25519_public_key_b64: String,
+    pub ml_dsa_public_key_b64: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct CpClient {
     base_url: String,
@@ -131,7 +137,7 @@ impl CpClient {
         Ok(())
     }
 
-    pub async fn fetch_signer_public_key(&self) -> Result<String> {
+    pub async fn fetch_signer_public_key(&self) -> Result<SignerPublicKeys> {
         let resp = self
             .authed(
                 self.http
@@ -141,10 +147,21 @@ impl CpClient {
             .await?
             .error_for_status()?;
         let v: serde_json::Value = resp.json().await?;
-        v.get("ed25519_public_key_b64")
+        let ed25519_public_key_b64 = v
+            .get("ed25519_public_key_b64")
             .and_then(|s| s.as_str())
             .map(ToString::to_string)
-            .ok_or_else(|| anyhow::anyhow!("control plane did not return ed25519_public_key_b64"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("control plane did not return ed25519_public_key_b64")
+            })?;
+        let ml_dsa_public_key_b64 = v
+            .get("ml_dsa_public_key_b64")
+            .and_then(|s| s.as_str())
+            .map(ToString::to_string);
+        Ok(SignerPublicKeys {
+            ed25519_public_key_b64,
+            ml_dsa_public_key_b64,
+        })
     }
 
     pub async fn create_approval(

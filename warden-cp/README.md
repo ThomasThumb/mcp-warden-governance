@@ -22,6 +22,9 @@ live.
 - **Admin/security visibility** - root can create non-root principals and
   API keys, revoke keys, and read summary, gateway, session, fingerprint, and
   audit-event views without connecting directly to the database.
+- **Enterprise identity hooks** - OIDC Authorization Code + PKCE login can
+  mint expiring bearer sessions, and SCIM 2.0 Users/Groups can lifecycle-sync
+  principals and group membership.
 
 ## Identity model
 
@@ -32,12 +35,16 @@ Every call gets attributed to two things, not one:
   principal* authorized that agent session to exist
 
 This mirrors OAuth 2.0 Token Exchange's actor-chain pattern (RFC 8693) and
-the SPIFFE ID shape on purpose. Neither is fully wired to the real
-ecosystem tools yet in this v0.1:
+the SPIFFE ID shape on purpose.
+- OIDC login maps verified ID-token subjects into `principal_identities` and
+  can sync group claims into `groups`/`group_members`.
+- SCIM lifecycle sync can create, update, deactivate, and group users; a
+  deactivated principal has API keys, OIDC sessions, and agent sessions
+  revoked.
 - Real SPIFFE/SPIRE would replace `mint_agent_session`'s local minting with
   actual SVID issuance - the column stays `spiffe_id`, only the issuer changes.
-- A real OAuth Token Exchange endpoint would replace `issue_token`'s
-  hand-rolled signing - the `act` claim shape carries over.
+- A real OAuth Token Exchange endpoint could still replace `issue_token`'s
+  local scoped-token endpoint later - the `act` claim shape carries over.
 
 Point being: adopting the real infrastructure later is a swap, not a
 rewrite, because the identifiers and claims are already shaped like it.
@@ -55,6 +62,12 @@ sqlx's `Any` driver. The honest tradeoff: hand-written SQL instead of sqlx's
 split `db.rs` into a real repository trait with a Postgres-specific
 implementation to get compile-time-checked queries and database-native
 migrations back. The handler code in `routes.rs` should not need to change.
+
+Dependency-audit note: sqlx 0.8's `Any` feature resolves the optional
+`sqlx-mysql` package into `Cargo.lock` even though this service enables only
+SQLite and Postgres drivers at runtime. `cargo tree -i sqlx-mysql --target all`
+should print `nothing to print`; if you ever enable MySQL, treat the
+RUSTSEC-2023-0071 `rsa` advisory as real until SQLx ships a fixed path.
 
 ### Postgres quick start
 
@@ -80,12 +93,12 @@ ML-KEM behavior to verify in your chosen Caddy build.
 
 ## PQC posture
 
-Ed25519 signing is real and wired up today (`identity.rs`). It authenticates
-short-lived scoped tokens, but it is not a post-quantum signature. The hybrid
-ML-DSA (FIPS 204) slot is intentionally not guessed at: adding it for real
-means pulling in a vetted ML-DSA implementation, checking current
-side-channel advisories, and requiring both Ed25519 and ML-DSA signatures to
-verify during the migration window.
+Scoped tokens are hybrid signed by default: Ed25519 remains the mature
+classical anchor, and ML-DSA-65 adds the FIPS 204 post-quantum signature.
+Gateways should require both signatures during the migration window. The
+implementation uses RustCrypto `ml-dsa`; its upstream docs still warn that
+the crate has not been independently audited, so do not remove Ed25519 or
+treat ML-DSA as your sole trust anchor yet.
 
 For "harvest now, decrypt later" risk, transport confidentiality is the
 priority. Use a TLS 1.3 reverse proxy or TLS provider that supports a
@@ -113,6 +126,32 @@ policy storage/versioning (`PUT/GET /v1/org-policy/:scope` - the enforcement
 side lives in `mcp-warden`'s `rego_policy.rs`, this is just the source of
 truth and version history).
 
+OIDC/SSO:
+
+```bash
+export OIDC_ISSUER_URL="https://idp.example.com"
+export OIDC_CLIENT_ID="warden-cp"
+export OIDC_CLIENT_SECRET="..."
+export OIDC_REDIRECT_URL="https://warden-cp.example.com/oidc/callback"
+export OIDC_ALLOWED_EMAIL_DOMAINS="example.com"
+export OIDC_DEFAULT_ROLES="security_admin"
+```
+
+Then open `/oidc/login`. The callback verifies issuer, audience, expiry,
+nonce, and the provider JWKS before creating an expiring `warden_session_*`
+bearer token.
+
+SCIM:
+
+- `GET /scim/v2/ServiceProviderConfig`
+- `GET/POST /scim/v2/Users`
+- `GET/PUT/PATCH/DELETE /scim/v2/Users/:id`
+- `GET/POST /scim/v2/Groups`
+- `GET/PUT/PATCH/DELETE /scim/v2/Groups/:id`
+
+SCIM endpoints require a bearer token whose principal has `root_admin` or
+`security_admin`, either directly or through group role inheritance.
+
 See `COMPLIANCE.md` for how these map to SOC 2 / ISO 42001 / EU AI Act.
 
 ## Explicit gaps - not built, not pretended
@@ -125,19 +164,18 @@ See `COMPLIANCE.md` for how these map to SOC 2 / ISO 42001 / EU AI Act.
   and prefer hybrid ML-KEM key establishment where your TLS stack supports it.
   Not implemented here because certificate management is a deployment
   decision, not something to guess at blind.
-- **Coarse RBAC, not enterprise IAM.** Non-root principals and API keys are
-  now real, with owner-scoped access for gateways, sessions, approvals,
-  policy, fingerprints, and audit reads. Root-admin can create principals,
-  keys, and assign coarse roles. What is not here yet: SSO/OIDC login,
-  per-scope delegated administrators, or SCIM lifecycle sync.
+- **OIDC/SCIM are protocol plumbing, not IdP magic.** OIDC login and SCIM
+  Users/Groups are implemented, including group-backed role inheritance and
+  lifecycle revocation. You still need to configure the IdP app, redirect URI,
+  SCIM bearer principal, group-role mapping, and offboarding policy.
 - **Secrets vault for local server credentials.** Nothing in this round
   touches the fact that a GitHub PAT sitting in a stdio server's env var on
   the gateway machine is still a plaintext secret on that machine. This is a
   deployment-specific decision (HashiCorp Vault vs. OS keychain vs. cloud
   KMS) that needs to be made deliberately, not defaulted.
-- **Backup/DR automation.** Postgres is now the recommended production
-  backend and a compose deployment is included, but backup schedules,
-  restore drills, retention rules, and managed-service PITR are still
+- **Backup/DR automation exists, scheduling does not.** Postgres backup,
+  restore, and restore-verification scripts are included, but schedules,
+  retention rules, managed-service PITR, and periodic restore drills are still
   operator responsibilities.
 - **Approval fatigue, longer-term.** The Rego auto-approve mechanism helps
   today. If a team is still drowning in approvals six months in, that's a
@@ -156,6 +194,7 @@ export DATABASE_URL="sqlite://warden-cp.db"
 export BIND_ADDR="127.0.0.1:7878"
 export TRUST_DOMAIN="acme.corp"
 export SIGNING_KEY_PATH="warden-cp-signing.key"   # back this file up - see below
+export ML_DSA_SIGNING_KEY_PATH="warden-cp-ml-dsa65.key" # back this up too
 export APPROVAL_WEBHOOK_URL="https://hooks.slack.com/services/..."  # optional, omit for CLI-only
 
 cargo run
@@ -166,6 +205,8 @@ cargo run
 First thing it logs is the Ed25519 public key. Gateways can either fetch it
 from `/v1/signer/public-key` at startup or pin it in `warden.toml` as
 `control_plane.signer_public_key_b64` for degraded/offline verification.
+That endpoint also returns `ml_dsa_public_key_b64`; new gateways require that
+second signature by default.
 
 ## Admin/API key quick start
 
@@ -192,6 +233,8 @@ Security/admin visibility endpoints:
 
 - `GET /v1/admin/summary`
 - `GET /admin`
+- `GET /v1/groups`
+- `PUT /v1/groups/<group-id>/roles`
 - `GET /v1/gateways`
 - `GET /v1/agent-sessions`
 - `GET /v1/tool-fingerprints`
@@ -222,7 +265,7 @@ nullclaw contributors. See `THIRD_PARTY_NOTICES.md`.
 
 ## Roadmap
 
-1. OIDC/SSO and SCIM lifecycle sync on top of the role model.
-2. Real SPIRE integration behind the `agent_sessions` table.
-3. Real ML-DSA hybrid signing once the crate's had more runway post-advisory.
-4. Richer dashboard workflows for approval decisions and policy editing.
+1. Real SPIRE integration behind the `agent_sessions` table.
+2. Richer dashboard workflows for approval decisions, SCIM status, and policy editing.
+3. FIPS 140-3 validated crypto provider option for deployments that require formal validation.
+4. External append-only audit anchoring for multi-replica HA deployments.

@@ -7,6 +7,7 @@ pub struct Principal {
     pub kind: String, // "human" | "service"
     pub display_name: String,
     pub external_id: Option<String>,
+    pub active: bool,
     pub created_at: String,
 }
 
@@ -25,6 +26,22 @@ pub struct CreateApiKeyRequest {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SetPrincipalRolesRequest {
     pub roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SetGroupRolesRequest {
+    pub roles: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct GroupView {
+    pub id: String,
+    pub display_name: String,
+    pub external_id: Option<String>,
+    pub active: bool,
+    pub roles: Vec<String>,
+    pub member_count: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize, Clone)]

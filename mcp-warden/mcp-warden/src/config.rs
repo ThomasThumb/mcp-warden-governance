@@ -37,6 +37,16 @@ pub struct ControlPlaneConfig {
     /// /v1/signer/public-key before serving.
     #[serde(default)]
     pub signer_public_key_b64: Option<String>,
+    /// Control-plane ML-DSA-65 public key used to verify the hybrid
+    /// post-quantum token signature. Fetched from /v1/signer/public-key when
+    /// omitted and the control plane is reachable.
+    #[serde(default)]
+    pub ml_dsa_public_key_b64: Option<String>,
+    /// Zero-trust default for new deployments: require both Ed25519 and
+    /// ML-DSA-65 signatures on scoped tokens. Set false only during migration
+    /// from an older control plane that cannot yet issue hybrid envelopes.
+    #[serde(default = "default_true")]
+    pub require_ml_dsa_token_signature: bool,
     /// Zero-trust default: when a control plane is configured, every tool call
     /// must carry a scoped token in `_meta.warden_token` (or, for older MCP
     /// clients, `arguments.__warden_token`, which is stripped before upstream).

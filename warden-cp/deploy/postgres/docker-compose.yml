@@ -28,6 +28,7 @@ services:
       BIND_ADDR: 0.0.0.0:7878
       TRUST_DOMAIN: ${TRUST_DOMAIN:-warden.local}
       SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-/var/lib/warden-cp/warden-cp-signing.key}
+      ML_DSA_SIGNING_KEY_PATH: ${ML_DSA_SIGNING_KEY_PATH:-/var/lib/warden-cp/warden-cp-ml-dsa65.key}
       APPROVAL_WEBHOOK_URL: ${APPROVAL_WEBHOOK_URL:-}
     ports:
       - "${WARDEN_CP_BIND:-127.0.0.1:7878}:7878"

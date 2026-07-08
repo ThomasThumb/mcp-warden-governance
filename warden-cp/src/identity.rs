@@ -1,7 +1,15 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{
+    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey as Ed25519SigningKey,
+    Verifier as Ed25519Verifier, VerifyingKey as Ed25519VerifyingKey,
+};
+use ml_dsa::{
+    Generate, KeyExport, KeyInit, Keypair, MlDsa65, SignatureEncoding, Signer as MlDsaSigner,
+    SigningKey as MlDsaSigningKey,
+};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// SPIFFE ID shape: spiffe://<trust-domain>/<path>. Using this format now -
 /// even though these are locally-minted, not SPIRE-issued - means the
@@ -44,34 +52,22 @@ pub struct ConfirmationClaim {
     pub ed25519_public_key_b64: String,
 }
 
-/// Classical signer, real and working today. The commented-out
-/// `ml_dsa_sig_b64` field below is where FIPS 204 (ML-DSA) hybrid signing
-/// slots in - RustCrypto's pure-Rust `ml-dsa` crate is the natural fit, but
-/// check GHSA-hcp2-x6j4-29j7 (a timing side-channel in its Decompose step,
-/// disclosed Jan 2026) is patched in whatever version you pull before
-/// relying on it. Shipping Ed25519-only today and adding ML-DSA as a second,
-/// separately-verified signature - not a replacement - is the hybrid pattern
-/// Cloudflare/AWS use for exactly this "don't trust the new primitive alone
-/// yet" reason.
 pub struct HybridSigner {
-    ed25519: SigningKey,
+    ed25519: Ed25519SigningKey,
+    ml_dsa65: Option<MlDsaSigningKey<MlDsa65>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SignedEnvelope {
     payload_b64: String,
     ed25519_sig_b64: String,
-    // ml_dsa_sig_b64: Option<String>,  // TODO: wire up RustCrypto `ml-dsa` here
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ml_dsa_alg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ml_dsa_sig_b64: Option<String>,
 }
 
 impl HybridSigner {
-    pub fn generate() -> Self {
-        let mut csprng = OsRng;
-        Self {
-            ed25519: SigningKey::generate(&mut csprng),
-        }
-    }
-
     /// Fixes the "restart silently invalidates every token" hole: loads a
     /// persisted 32-byte seed if present, otherwise generates one and writes
     /// it with owner-only permissions (0600 on Unix - Windows ACLs aren't
@@ -79,41 +75,61 @@ impl HybridSigner {
     /// This file is as sensitive as a root password. Treat it that way:
     /// back it up somewhere real, don't commit it, restrict who can read the
     /// host it lives on.
-    pub fn load_or_generate(path: &std::path::Path) -> anyhow::Result<Self> {
-        if let Ok(bytes) = std::fs::read(path) {
+    pub fn load_or_generate(path: &Path, ml_dsa_path: Option<&Path>) -> anyhow::Result<Self> {
+        let ed25519 = if let Ok(bytes) = std::fs::read(path) {
             let seed: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("signing key file is the wrong length"))?;
-            return Ok(Self {
-                ed25519: SigningKey::from_bytes(&seed),
-            });
-        }
+            Ed25519SigningKey::from_bytes(&seed)
+        } else {
+            let mut csprng = OsRng;
+            let signing_key = Ed25519SigningKey::generate(&mut csprng);
+            std::fs::write(path, signing_key.to_bytes())?;
+            restrict_key_file(path)?;
+            tracing::warn!(
+                "generated a new Ed25519 signing key at {path:?} - back this file up now, \
+                 losing it invalidates issued tokens"
+            );
+            signing_key
+        };
 
-        let signer = Self::generate();
-        std::fs::write(path, signer.ed25519.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        tracing::warn!(
-            "generated a new signing key at {path:?} - back this file up now, \
-             losing it invalidates every token this control plane has ever issued"
-        );
-        Ok(signer)
+        let ml_dsa65 = match ml_dsa_path {
+            Some(path) => Some(load_or_generate_ml_dsa(path)?),
+            None => None,
+        };
+
+        Ok(Self { ed25519, ml_dsa65 })
     }
 
-    pub fn verifying_key_b64(&self) -> String {
+    pub fn ed25519_verifying_key_b64(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.ed25519.verifying_key().to_bytes())
+    }
+
+    pub fn ml_dsa65_verifying_key_b64(&self) -> Option<String> {
+        self.ml_dsa65
+            .as_ref()
+            .map(|key| URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes().as_slice()))
     }
 
     pub fn sign_token(&self, claims: &TokenClaims) -> anyhow::Result<String> {
         let payload = serde_json::to_vec(claims)?;
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload);
-        let sig: Signature = self.ed25519.sign(payload_b64.as_bytes());
+        let sig: Ed25519Signature = self.ed25519.sign(payload_b64.as_bytes());
+        let (ml_dsa_alg, ml_dsa_sig_b64) = match &self.ml_dsa65 {
+            Some(key) => {
+                let sig = key.sign(payload_b64.as_bytes());
+                (
+                    Some("ML-DSA-65".to_string()),
+                    Some(URL_SAFE_NO_PAD.encode(sig.to_bytes().as_slice())),
+                )
+            }
+            None => (None, None),
+        };
         let envelope = SignedEnvelope {
             payload_b64,
             ed25519_sig_b64: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+            ml_dsa_alg,
+            ml_dsa_sig_b64,
         };
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
     }
@@ -125,12 +141,12 @@ impl HybridSigner {
     ) -> anyhow::Result<TokenClaims> {
         let envelope_bytes = URL_SAFE_NO_PAD.decode(token)?;
         let envelope: SignedEnvelope = serde_json::from_slice(&envelope_bytes)?;
-        let vk = VerifyingKey::from_bytes(verifying_key_bytes)?;
+        let vk = Ed25519VerifyingKey::from_bytes(verifying_key_bytes)?;
         let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
             .decode(&envelope.ed25519_sig_b64)?
             .try_into()
             .map_err(|_| anyhow::anyhow!("bad signature length"))?;
-        let sig = Signature::from_bytes(&sig_bytes);
+        let sig = Ed25519Signature::from_bytes(&sig_bytes);
         vk.verify(envelope.payload_b64.as_bytes(), &sig)?;
         let payload = URL_SAFE_NO_PAD.decode(&envelope.payload_b64)?;
         let claims: TokenClaims = serde_json::from_slice(&payload)?;
@@ -139,4 +155,31 @@ impl HybridSigner {
         }
         Ok(claims)
     }
+}
+
+fn load_or_generate_ml_dsa(path: &Path) -> anyhow::Result<MlDsaSigningKey<MlDsa65>> {
+    if let Ok(bytes) = std::fs::read(path) {
+        return Ok(MlDsaSigningKey::<MlDsa65>::new_from_slice(&bytes)?);
+    }
+
+    let key = MlDsaSigningKey::<MlDsa65>::generate();
+    std::fs::write(path, key.to_seed().as_slice())?;
+    restrict_key_file(path)?;
+    tracing::warn!(
+        "generated a new ML-DSA-65 signing key at {path:?} - back this file up with the Ed25519 key"
+    );
+    Ok(key)
+}
+
+fn restrict_key_file(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }

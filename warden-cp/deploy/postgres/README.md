@@ -43,7 +43,10 @@ At least once before production use:
 
 ## Production Notes
 
-- Store `.env` and `warden-cp-signing.key` outside source control.
-- Back up `warden-cp-signing.key`; losing it invalidates issued tokens.
+- Store `.env`, `warden-cp-signing.key`, and `warden-cp-ml-dsa65.key`
+  outside source control.
+- Back up both signing keys; losing either invalidates issued hybrid tokens.
+- Configure OIDC/SCIM through environment and a dedicated admin principal
+  before connecting an enterprise IdP.
 - Monitor disk usage, connection count, slow queries, and failed auth.
 - Do not expose either Postgres or `warden-cp` directly to the internet.

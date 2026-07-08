@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS principals (
     kind            TEXT NOT NULL,      -- 'human' | 'service'
     display_name    TEXT NOT NULL,
     external_id     TEXT,               -- SSO subject / email / service account id
+    active          INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
 );
 
@@ -26,6 +27,55 @@ CREATE TABLE IF NOT EXISTS principal_roles (
     principal_id    TEXT NOT NULL REFERENCES principals(id),
     role            TEXT NOT NULL,      -- 'root_admin' | 'security_admin' | 'gateway_owner'
     PRIMARY KEY (principal_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS principal_identities (
+    provider            TEXT NOT NULL,  -- 'oidc' | 'scim'
+    external_subject    TEXT NOT NULL,
+    principal_id        TEXT NOT NULL REFERENCES principals(id),
+    email               TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (provider, external_subject)
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    id              TEXT PRIMARY KEY,
+    display_name    TEXT NOT NULL,
+    external_id     TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+    group_id        TEXT NOT NULL REFERENCES groups(id),
+    principal_id    TEXT NOT NULL REFERENCES principals(id),
+    PRIMARY KEY (group_id, principal_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_roles (
+    group_id        TEXT NOT NULL REFERENCES groups(id),
+    role            TEXT NOT NULL,      -- 'root_admin' | 'security_admin' | 'gateway_owner'
+    PRIMARY KEY (group_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id              TEXT PRIMARY KEY,
+    principal_id    TEXT NOT NULL REFERENCES principals(id),
+    token_hash      TEXT NOT NULL UNIQUE,
+    source          TEXT NOT NULL,      -- 'oidc'
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    revoked_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS oidc_login_states (
+    state           TEXT PRIMARY KEY,
+    nonce           TEXT NOT NULL,
+    code_verifier   TEXT NOT NULL,
+    return_to       TEXT,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL
 );
 
 -- A per-agent, short-lived, cryptographically verifiable identity - the
@@ -141,3 +191,7 @@ CREATE TABLE IF NOT EXISTS org_policies (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts);
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approval_requests(status);
 CREATE INDEX IF NOT EXISTS idx_principal_roles_role ON principal_roles(role);
+CREATE INDEX IF NOT EXISTS idx_principal_identities_principal ON principal_identities(principal_id);
+CREATE INDEX IF NOT EXISTS idx_group_members_principal ON group_members(principal_id);
+CREATE INDEX IF NOT EXISTS idx_group_roles_role ON group_roles(role);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_hash ON auth_sessions(token_hash);

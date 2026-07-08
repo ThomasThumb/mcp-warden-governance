@@ -266,8 +266,13 @@ impl Gateway {
             return Ok(CallIdentity::default());
         };
 
-        let claims = verify_token(signer_key, token)
-            .map_err(|e| Self::deny(format!("invalid agent token: {e}")))?;
+        let claims = verify_token(
+            signer_key,
+            cp_cfg.ml_dsa_public_key_b64.as_deref(),
+            cp_cfg.require_ml_dsa_token_signature,
+            token,
+        )
+        .map_err(|e| Self::deny(format!("invalid agent token: {e}")))?;
         if claims.gateway_id != cp_cfg.gateway_id {
             return Err(Self::deny("agent token is scoped to a different gateway"));
         }
