@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS principals (
     kind            TEXT NOT NULL,      -- 'human' | 'service'
     display_name    TEXT NOT NULL,
     external_id     TEXT,               -- SSO subject / email / service account id
-    active          INTEGER NOT NULL DEFAULT 1,
+    active          BIGINT NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
 );
 
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS groups (
     id              TEXT PRIMARY KEY,
     display_name    TEXT NOT NULL,
     external_id     TEXT,
-    active          INTEGER NOT NULL DEFAULT 1,
+    active          BIGINT NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
 );
 
@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS tool_fingerprints (
 CREATE TABLE IF NOT EXISTS policy_bundles (
     id              TEXT PRIMARY KEY,
     scope           TEXT NOT NULL,      -- a gateway id, or a client/app label
-    version         INTEGER NOT NULL,
+    version         BIGINT NOT NULL,
     bundle_json     TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     created_by      TEXT NOT NULL REFERENCES principals(id)
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE TABLE IF NOT EXISTS org_policies (
     id              TEXT PRIMARY KEY,
     scope           TEXT NOT NULL,
-    version         INTEGER NOT NULL,
+    version         BIGINT NOT NULL,
     rego_source     TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     created_by      TEXT NOT NULL REFERENCES principals(id)

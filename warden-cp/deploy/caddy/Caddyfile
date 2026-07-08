@@ -7,7 +7,7 @@
 warden-cp.example.com {
 	tls {
 		protocols tls1.3
-		curves x25519mlkem768 x25519
+		curves x25519mlkem768
 	}
 
 	encode zstd gzip

@@ -18,7 +18,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-async fn load_chain_tail(pool: &sqlx::AnyPool) -> String {
+async fn load_chain_tail(pool: &db::DbPool) -> String {
     let row = sqlx::query("SELECT entry_hash FROM audit_events ORDER BY ts DESC LIMIT 1")
         .fetch_optional(pool)
         .await

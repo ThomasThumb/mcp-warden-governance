@@ -4,7 +4,9 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use sha2::{Digest, Sha256};
-use sqlx::{AnyPool, Row};
+use sqlx::Row;
+
+use crate::db::DbPool;
 use uuid::Uuid;
 
 use crate::routes::AppState;
@@ -60,7 +62,7 @@ pub async fn require_auth(
         "SELECT api_keys.principal_id as principal_id
          FROM api_keys
          JOIN principals ON principals.id = api_keys.principal_id
-         WHERE api_keys.key_hash = ?
+         WHERE api_keys.key_hash = $1
            AND api_keys.revoked_at IS NULL
            AND principals.active = 1",
     )
@@ -77,9 +79,9 @@ pub async fn require_auth(
                 "SELECT auth_sessions.principal_id as principal_id
                  FROM auth_sessions
                  JOIN principals ON principals.id = auth_sessions.principal_id
-                 WHERE auth_sessions.token_hash = ?
+                 WHERE auth_sessions.token_hash = $1
                    AND auth_sessions.revoked_at IS NULL
-                   AND auth_sessions.expires_at > ?
+                   AND auth_sessions.expires_at > $2
                    AND principals.active = 1",
             )
             .bind(&key_hash)
@@ -107,7 +109,7 @@ pub async fn require_auth(
 /// only moment the raw key exists outside the operator's hands - store it
 /// somewhere real (a password manager, a vault), because it can't be
 /// recovered, only revoked and replaced.
-pub async fn bootstrap_root_key_if_needed(pool: &AnyPool) -> anyhow::Result<()> {
+pub async fn bootstrap_root_key_if_needed(pool: &DbPool) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO principal_roles (principal_id, role)
          SELECT id, 'root_admin' FROM principals WHERE display_name = 'root-admin'
@@ -128,7 +130,7 @@ pub async fn bootstrap_root_key_if_needed(pool: &AnyPool) -> anyhow::Result<()> 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO principals (id, kind, display_name, external_id, created_at)
-         VALUES (?, 'service', 'root-admin', NULL, ?)",
+         VALUES ($1, 'service', 'root-admin', NULL, $2)",
     )
     .bind(&principal_id)
     .bind(&now)
@@ -138,7 +140,7 @@ pub async fn bootstrap_root_key_if_needed(pool: &AnyPool) -> anyhow::Result<()> 
     let raw_key = format!("warden_root_{}", Uuid::new_v4().simple());
     let key_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO api_keys (id, principal_id, key_hash, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO api_keys (id, principal_id, key_hash, created_at) VALUES ($1, $2, $3, $4)",
     )
     .bind(&key_id)
     .bind(&principal_id)
@@ -147,7 +149,7 @@ pub async fn bootstrap_root_key_if_needed(pool: &AnyPool) -> anyhow::Result<()> 
     .execute(pool)
     .await?;
 
-    sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES (?, 'root_admin')")
+    sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES ($1, 'root_admin')")
         .bind(&principal_id)
         .execute(pool)
         .await?;

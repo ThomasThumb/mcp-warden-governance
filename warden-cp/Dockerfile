@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --no-default-features --features postgres
 
 FROM debian:bookworm-slim
 RUN apt-get update \

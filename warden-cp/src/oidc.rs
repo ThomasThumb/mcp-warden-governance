@@ -127,7 +127,7 @@ pub async fn login(
     sqlx::query(
         "INSERT INTO oidc_login_states
              (state, nonce, code_verifier, return_to, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&state_value)
     .bind(&nonce)
@@ -160,14 +160,14 @@ pub async fn callback(
     let cfg = oidc(&state)?;
     let state_row = sqlx::query(
         "SELECT nonce, code_verifier, return_to, expires_at
-         FROM oidc_login_states WHERE state = ?",
+         FROM oidc_login_states WHERE state = $1",
     )
     .bind(&query.state)
     .fetch_optional(&state.pool)
     .await
     .map_err(err500)?;
 
-    sqlx::query("DELETE FROM oidc_login_states WHERE state = ?")
+    sqlx::query("DELETE FROM oidc_login_states WHERE state = $1")
         .bind(&query.state)
         .execute(&state.pool)
         .await
@@ -338,7 +338,7 @@ async fn upsert_principal(
     let now = Utc::now().to_rfc3339();
     if let Some(row) = sqlx::query(
         "SELECT principal_id FROM principal_identities
-         WHERE provider = 'oidc' AND external_subject = ?",
+         WHERE provider = 'oidc' AND external_subject = $1",
     )
     .bind(&subject)
     .fetch_optional(&state.pool)
@@ -347,15 +347,15 @@ async fn upsert_principal(
     {
         let principal_id: String = row.try_get("principal_id").map_err(err500)?;
         let display_name = display_name(claims, email);
-        sqlx::query("UPDATE principals SET display_name = ?, active = 1 WHERE id = ?")
+        sqlx::query("UPDATE principals SET display_name = $1, active = 1 WHERE id = $2")
             .bind(&display_name)
             .bind(&principal_id)
             .execute(&state.pool)
             .await
             .map_err(err500)?;
         sqlx::query(
-            "UPDATE principal_identities SET email = ?, updated_at = ?
-             WHERE provider = 'oidc' AND external_subject = ?",
+            "UPDATE principal_identities SET email = $1, updated_at = $2
+             WHERE provider = 'oidc' AND external_subject = $3",
         )
         .bind(email)
         .bind(&now)
@@ -371,7 +371,7 @@ async fn upsert_principal(
     let display_name = display_name(claims, email);
     sqlx::query(
         "INSERT INTO principals (id, kind, display_name, external_id, active, created_at)
-         VALUES (?, 'human', ?, ?, 1, ?)",
+         VALUES ($1, 'human', $2, $3, 1, $4)",
     )
     .bind(&principal_id)
     .bind(&display_name)
@@ -383,7 +383,7 @@ async fn upsert_principal(
     sqlx::query(
         "INSERT INTO principal_identities
              (provider, external_subject, principal_id, email, created_at, updated_at)
-         VALUES ('oidc', ?, ?, ?, ?, ?)",
+         VALUES ('oidc', $1, $2, $3, $4, $5)",
     )
     .bind(&subject)
     .bind(&principal_id)
@@ -407,7 +407,7 @@ async fn sync_oidc_groups(
     let rows = sqlx::query(
         "SELECT group_id FROM group_members
          JOIN groups ON groups.id = group_members.group_id
-         WHERE group_members.principal_id = ? AND groups.external_id LIKE ?",
+         WHERE group_members.principal_id = $1 AND groups.external_id LIKE $2",
     )
     .bind(principal_id)
     .bind(format!("{prefix}%"))
@@ -416,7 +416,7 @@ async fn sync_oidc_groups(
     .map_err(err500)?;
     for row in rows {
         let group_id: String = row.try_get("group_id").map_err(err500)?;
-        sqlx::query("DELETE FROM group_members WHERE group_id = ? AND principal_id = ?")
+        sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND principal_id = $2")
             .bind(&group_id)
             .bind(principal_id)
             .execute(&state.pool)
@@ -432,7 +432,7 @@ async fn sync_oidc_groups(
         let group_id = upsert_group(state, group, &external_id).await?;
         sqlx::query(
             "INSERT INTO group_members (group_id, principal_id)
-             VALUES (?, ?) ON CONFLICT(group_id, principal_id) DO NOTHING",
+             VALUES ($1, $2) ON CONFLICT(group_id, principal_id) DO NOTHING",
         )
         .bind(&group_id)
         .bind(principal_id)
@@ -448,14 +448,14 @@ async fn upsert_group(
     display_name: &str,
     external_id: &str,
 ) -> ApiResult<String> {
-    if let Some(row) = sqlx::query("SELECT id FROM groups WHERE external_id = ?")
+    if let Some(row) = sqlx::query("SELECT id FROM groups WHERE external_id = $1")
         .bind(external_id)
         .fetch_optional(&state.pool)
         .await
         .map_err(err500)?
     {
         let id: String = row.try_get("id").map_err(err500)?;
-        sqlx::query("UPDATE groups SET display_name = ?, active = 1 WHERE id = ?")
+        sqlx::query("UPDATE groups SET display_name = $1, active = 1 WHERE id = $2")
             .bind(display_name)
             .bind(&id)
             .execute(&state.pool)
@@ -466,7 +466,7 @@ async fn upsert_group(
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO groups (id, display_name, external_id, active, created_at)
-         VALUES (?, ?, ?, 1, ?)",
+         VALUES ($1, $2, $3, 1, $4)",
     )
     .bind(&id)
     .bind(display_name)
@@ -489,7 +489,7 @@ async fn apply_default_roles(
         }
         sqlx::query(
             "INSERT INTO principal_roles (principal_id, role)
-             VALUES (?, ?) ON CONFLICT(principal_id, role) DO NOTHING",
+             VALUES ($1, $2) ON CONFLICT(principal_id, role) DO NOTHING",
         )
         .bind(principal_id)
         .bind(role)
@@ -511,7 +511,7 @@ async fn create_session(
     sqlx::query(
         "INSERT INTO auth_sessions
              (id, principal_id, token_hash, source, created_at, expires_at)
-         VALUES (?, ?, ?, 'oidc', ?, ?)",
+         VALUES ($1, $2, $3, 'oidc', $4, $5)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(principal_id)

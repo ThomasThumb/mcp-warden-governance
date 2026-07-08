@@ -10,6 +10,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::auth::AuthedPrincipal;
+use crate::db::DbRow;
 use crate::routes::AppState;
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
@@ -112,10 +113,15 @@ pub async fn list_users(
     let (where_sql, bind_value) = filter_clause(query.filter.as_deref(), "userName");
     let limit = query.count.unwrap_or(100).clamp(1, 200);
     let offset = query.start_index.unwrap_or(1).max(1) - 1;
+    let (limit_param, offset_param) = if bind_value.is_some() {
+        ("$2", "$3")
+    } else {
+        ("$1", "$2")
+    };
     let sql = format!(
         "SELECT id, display_name, external_id, active, created_at FROM principals
          WHERE kind = 'human' {where_sql}
-         ORDER BY display_name LIMIT ? OFFSET ?"
+         ORDER BY display_name LIMIT {limit_param} OFFSET {offset_param}"
     );
     let mut q = sqlx::query(&sql);
     if let Some(value) = bind_value {
@@ -185,7 +191,7 @@ pub async fn patch_user(
             if op.value == Some(Value::Bool(false)) {
                 deactivate_principal(&state, &id).await?;
             } else if op.value == Some(Value::Bool(true)) {
-                sqlx::query("UPDATE principals SET active = 1 WHERE id = ?")
+                sqlx::query("UPDATE principals SET active = 1 WHERE id = $1")
                     .bind(&id)
                     .execute(&state.pool)
                     .await
@@ -193,7 +199,7 @@ pub async fn patch_user(
             }
         } else if path == "displayname" || path == "username" {
             if let Some(Value::String(value)) = op.value {
-                sqlx::query("UPDATE principals SET display_name = ? WHERE id = ?")
+                sqlx::query("UPDATE principals SET display_name = $1 WHERE id = $2")
                     .bind(value)
                     .bind(&id)
                     .execute(&state.pool)
@@ -226,10 +232,15 @@ pub async fn list_groups(
     let (where_sql, bind_value) = filter_clause(query.filter.as_deref(), "displayName");
     let limit = query.count.unwrap_or(100).clamp(1, 200);
     let offset = query.start_index.unwrap_or(1).max(1) - 1;
+    let (limit_param, offset_param) = if bind_value.is_some() {
+        ("$2", "$3")
+    } else {
+        ("$1", "$2")
+    };
     let sql = format!(
         "SELECT id, display_name, external_id, active, created_at FROM groups
          WHERE active = 1 {where_sql}
-         ORDER BY display_name LIMIT ? OFFSET ?"
+         ORDER BY display_name LIMIT {limit_param} OFFSET {offset_param}"
     );
     let mut q = sqlx::query(&sql);
     if let Some(value) = bind_value {
@@ -298,7 +309,7 @@ pub async fn patch_group(
             apply_member_patch(&state, &id, &op_name, op.value).await?;
         } else if path == "displayname" {
             if let Some(Value::String(value)) = op.value {
-                sqlx::query("UPDATE groups SET display_name = ? WHERE id = ?")
+                sqlx::query("UPDATE groups SET display_name = $1 WHERE id = $2")
                     .bind(value)
                     .bind(&id)
                     .execute(&state.pool)
@@ -317,12 +328,12 @@ pub async fn delete_group(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     ensure_scim_admin(&state, &principal).await?;
-    sqlx::query("UPDATE groups SET active = 0 WHERE id = ?")
+    sqlx::query("UPDATE groups SET active = 0 WHERE id = $1")
         .bind(&id)
         .execute(&state.pool)
         .await
         .map_err(err500)?;
-    sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+    sqlx::query("DELETE FROM group_members WHERE group_id = $1")
         .bind(&id)
         .execute(&state.pool)
         .await
@@ -333,12 +344,12 @@ pub async fn delete_group(
 async fn ensure_scim_admin(state: &AppState, principal: &AuthedPrincipal) -> ApiResult<()> {
     let row = sqlx::query(
         "SELECT 1 FROM principal_roles
-         WHERE principal_id = ? AND role IN ('root_admin', 'security_admin')
+         WHERE principal_id = $1 AND role IN ('root_admin', 'security_admin')
          UNION
          SELECT 1 FROM group_members
          JOIN groups ON groups.id = group_members.group_id
          JOIN group_roles ON group_roles.group_id = group_members.group_id
-         WHERE group_members.principal_id = ?
+         WHERE group_members.principal_id = $2
            AND groups.active = 1
            AND group_roles.role IN ('root_admin', 'security_admin')
          LIMIT 1",
@@ -362,7 +373,7 @@ async fn upsert_user(state: &AppState, req: ScimUserIn) -> ApiResult<String> {
         .unwrap_or_else(|| req.user_name.clone());
     if let Some(row) = sqlx::query(
         "SELECT principal_id FROM principal_identities
-         WHERE provider = 'scim' AND external_subject = ?",
+         WHERE provider = 'scim' AND external_subject = $1",
     )
     .bind(&subject)
     .fetch_optional(&state.pool)
@@ -385,7 +396,7 @@ async fn upsert_user(state: &AppState, req: ScimUserIn) -> ApiResult<String> {
         .unwrap_or_else(|| req.user_name.clone());
     sqlx::query(
         "INSERT INTO principals (id, kind, display_name, external_id, active, created_at)
-         VALUES (?, 'human', ?, ?, ?, ?)",
+         VALUES ($1, 'human', $2, $3, $4, $5)",
     )
     .bind(&id)
     .bind(display)
@@ -398,7 +409,7 @@ async fn upsert_user(state: &AppState, req: ScimUserIn) -> ApiResult<String> {
     sqlx::query(
         "INSERT INTO principal_identities
              (provider, external_subject, principal_id, email, created_at, updated_at)
-         VALUES ('scim', ?, ?, ?, ?, ?)",
+         VALUES ('scim', $1, $2, $3, $4, $5)",
     )
     .bind(&subject)
     .bind(&id)
@@ -419,7 +430,7 @@ async fn update_user(state: &AppState, id: &str, req: &ScimUserIn) -> ApiResult<
         .display_name
         .clone()
         .unwrap_or_else(|| req.user_name.clone());
-    sqlx::query("UPDATE principals SET display_name = ?, active = ? WHERE id = ?")
+    sqlx::query("UPDATE principals SET display_name = $1, active = $2 WHERE id = $3")
         .bind(display)
         .bind(if req.active.unwrap_or(true) { 1 } else { 0 })
         .bind(id)
@@ -427,8 +438,8 @@ async fn update_user(state: &AppState, id: &str, req: &ScimUserIn) -> ApiResult<
         .await
         .map_err(err500)?;
     sqlx::query(
-        "UPDATE principal_identities SET email = ?, updated_at = ?
-         WHERE provider = 'scim' AND principal_id = ?",
+        "UPDATE principal_identities SET email = $1, updated_at = $2
+         WHERE provider = 'scim' AND principal_id = $3",
     )
     .bind(primary_email(req))
     .bind(Utc::now().to_rfc3339())
@@ -444,7 +455,7 @@ async fn upsert_group(state: &AppState, req: ScimGroupIn) -> ApiResult<String> {
         .external_id
         .clone()
         .unwrap_or_else(|| req.display_name.clone());
-    if let Some(row) = sqlx::query("SELECT id FROM groups WHERE external_id = ?")
+    if let Some(row) = sqlx::query("SELECT id FROM groups WHERE external_id = $1")
         .bind(format!("scim:{external}"))
         .fetch_optional(&state.pool)
         .await
@@ -459,7 +470,7 @@ async fn upsert_group(state: &AppState, req: ScimGroupIn) -> ApiResult<String> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO groups (id, display_name, external_id, active, created_at)
-         VALUES (?, ?, ?, 1, ?)",
+         VALUES ($1, $2, $3, 1, $4)",
     )
     .bind(&id)
     .bind(&req.display_name)
@@ -473,7 +484,7 @@ async fn upsert_group(state: &AppState, req: ScimGroupIn) -> ApiResult<String> {
 }
 
 async fn update_group(state: &AppState, id: &str, req: &ScimGroupIn) -> ApiResult<()> {
-    sqlx::query("UPDATE groups SET display_name = ?, active = 1 WHERE id = ?")
+    sqlx::query("UPDATE groups SET display_name = $1, active = 1 WHERE id = $2")
         .bind(&req.display_name)
         .bind(id)
         .execute(&state.pool)
@@ -487,7 +498,7 @@ async fn replace_members(
     group_id: &str,
     members: Option<&[ScimMember]>,
 ) -> ApiResult<()> {
-    sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+    sqlx::query("DELETE FROM group_members WHERE group_id = $1")
         .bind(group_id)
         .execute(&state.pool)
         .await
@@ -512,7 +523,7 @@ async fn apply_member_patch(
     match op {
         "add" | "replace" => {
             if op == "replace" {
-                sqlx::query("DELETE FROM group_members WHERE group_id = ?")
+                sqlx::query("DELETE FROM group_members WHERE group_id = $1")
                     .bind(group_id)
                     .execute(&state.pool)
                     .await
@@ -525,7 +536,7 @@ async fn apply_member_patch(
         }
         "remove" => {
             for member in members {
-                sqlx::query("DELETE FROM group_members WHERE group_id = ? AND principal_id = ?")
+                sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND principal_id = $2")
                     .bind(group_id)
                     .bind(member.value)
                     .execute(&state.pool)
@@ -556,7 +567,7 @@ fn parse_members(value: Option<Value>) -> ApiResult<Vec<ScimMember>> {
 async fn add_member(state: &AppState, group_id: &str, principal_id: &str) -> ApiResult<()> {
     sqlx::query(
         "INSERT INTO group_members (group_id, principal_id)
-         VALUES (?, ?) ON CONFLICT(group_id, principal_id) DO NOTHING",
+         VALUES ($1, $2) ON CONFLICT(group_id, principal_id) DO NOTHING",
     )
     .bind(group_id)
     .bind(principal_id)
@@ -568,19 +579,13 @@ async fn add_member(state: &AppState, group_id: &str, principal_id: &str) -> Api
 
 async fn deactivate_principal(state: &AppState, id: &str) -> ApiResult<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE principals SET active = 0 WHERE id = ?")
-        .bind(id)
-        .execute(&state.pool)
-        .await
-        .map_err(err500)?;
-    sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL")
-        .bind(&now)
+    sqlx::query("UPDATE principals SET active = 0 WHERE id = $1")
         .bind(id)
         .execute(&state.pool)
         .await
         .map_err(err500)?;
     sqlx::query(
-        "UPDATE auth_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL",
+        "UPDATE api_keys SET revoked_at = $1 WHERE principal_id = $2 AND revoked_at IS NULL",
     )
     .bind(&now)
     .bind(id)
@@ -588,7 +593,15 @@ async fn deactivate_principal(state: &AppState, id: &str) -> ApiResult<()> {
     .await
     .map_err(err500)?;
     sqlx::query(
-        "UPDATE agent_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL",
+        "UPDATE auth_sessions SET revoked_at = $1 WHERE principal_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(&now)
+    .bind(id)
+    .execute(&state.pool)
+    .await
+    .map_err(err500)?;
+    sqlx::query(
+        "UPDATE agent_sessions SET revoked_at = $1 WHERE principal_id = $2 AND revoked_at IS NULL",
     )
     .bind(&now)
     .bind(id)
@@ -598,9 +611,9 @@ async fn deactivate_principal(state: &AppState, id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn principal_row(state: &AppState, id: &str) -> ApiResult<sqlx::any::AnyRow> {
+async fn principal_row(state: &AppState, id: &str) -> ApiResult<DbRow> {
     sqlx::query(
-        "SELECT id, display_name, external_id, active, created_at FROM principals WHERE id = ?",
+        "SELECT id, display_name, external_id, active, created_at FROM principals WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -609,13 +622,15 @@ async fn principal_row(state: &AppState, id: &str) -> ApiResult<sqlx::any::AnyRo
     .ok_or((StatusCode::NOT_FOUND, "SCIM user not found".into()))
 }
 
-async fn group_row(state: &AppState, id: &str) -> ApiResult<sqlx::any::AnyRow> {
-    sqlx::query("SELECT id, display_name, external_id, active, created_at FROM groups WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(err500)?
-        .ok_or((StatusCode::NOT_FOUND, "SCIM group not found".into()))
+async fn group_row(state: &AppState, id: &str) -> ApiResult<DbRow> {
+    sqlx::query(
+        "SELECT id, display_name, external_id, active, created_at FROM groups WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(err500)?
+    .ok_or((StatusCode::NOT_FOUND, "SCIM group not found".into()))
 }
 
 async fn ensure_principal(state: &AppState, id: &str) -> ApiResult<()> {
@@ -626,11 +641,11 @@ async fn ensure_group(state: &AppState, id: &str) -> ApiResult<()> {
     group_row(state, id).await.map(|_| ())
 }
 
-async fn user_json(state: &AppState, row: &sqlx::any::AnyRow) -> ApiResult<Value> {
+async fn user_json(state: &AppState, row: &DbRow) -> ApiResult<Value> {
     let id: String = row.try_get("id").map_err(err500)?;
     let identities = sqlx::query(
         "SELECT external_subject, email FROM principal_identities
-         WHERE provider = 'scim' AND principal_id = ?",
+         WHERE provider = 'scim' AND principal_id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -653,13 +668,13 @@ async fn user_json(state: &AppState, row: &sqlx::any::AnyRow) -> ApiResult<Value
     }))
 }
 
-async fn group_json(state: &AppState, row: &sqlx::any::AnyRow) -> ApiResult<Value> {
+async fn group_json(state: &AppState, row: &DbRow) -> ApiResult<Value> {
     let id: String = row.try_get("id").map_err(err500)?;
     let member_rows = sqlx::query(
         "SELECT principals.id, principals.display_name
          FROM group_members
          JOIN principals ON principals.id = group_members.principal_id
-         WHERE group_members.group_id = ?
+         WHERE group_members.group_id = $1
          ORDER BY principals.display_name",
     )
     .bind(&id)
@@ -703,9 +718,9 @@ fn filter_clause(filter: Option<&str>, field: &str) -> (String, Option<String>) 
     }
     let value = filter[prefix.len()..].trim().trim_matches('"').to_string();
     if field == "userName" {
-        ("AND id IN (SELECT principal_id FROM principal_identities WHERE provider = 'scim' AND external_subject = ?)".into(), Some(value))
+        ("AND id IN (SELECT principal_id FROM principal_identities WHERE provider = 'scim' AND external_subject = $1)".into(), Some(value))
     } else {
-        ("AND display_name = ?".into(), Some(value))
+        ("AND display_name = $1".into(), Some(value))
     }
 }
 

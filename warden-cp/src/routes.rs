@@ -14,14 +14,14 @@ use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::auth::AuthedPrincipal;
+use crate::db::{DbPool, DbRow};
 use crate::identity::{mint_spiffe_id, ActorClaim, HybridSigner, TokenClaims};
 use crate::models::*;
 use crate::notify::Notifier;
-use sqlx::AnyPool;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: AnyPool,
+    pub pool: DbPool,
     pub signer: Arc<HybridSigner>,
     pub oidc: Option<Arc<crate::oidc::OidcConfig>>,
     pub notifier: Arc<Notifier>,
@@ -86,7 +86,7 @@ fn forbidden(msg: impl Into<String>) -> (StatusCode, String) {
 }
 
 async fn gateway_owner(state: &AppState, gateway_id: &str) -> ApiResult<Option<String>> {
-    let row = sqlx::query("SELECT owner_principal_id FROM gateways WHERE id = ?")
+    let row = sqlx::query("SELECT owner_principal_id FROM gateways WHERE id = $1")
         .bind(gateway_id)
         .fetch_optional(&state.pool)
         .await
@@ -134,7 +134,7 @@ async fn ensure_session_owner(
     principal: &AuthedPrincipal,
     session_id: &str,
 ) -> ApiResult<()> {
-    let row = sqlx::query("SELECT principal_id FROM agent_sessions WHERE id = ?")
+    let row = sqlx::query("SELECT principal_id FROM agent_sessions WHERE id = $1")
         .bind(session_id)
         .fetch_optional(&state.pool)
         .await
@@ -160,14 +160,14 @@ pub async fn principal_has_role(
 ) -> ApiResult<bool> {
     let row = sqlx::query(
         "SELECT 1 FROM principal_roles
-         WHERE principal_id = ? AND role = ?
+         WHERE principal_id = $1 AND role = $2
          UNION
          SELECT 1 FROM group_members
          JOIN groups ON groups.id = group_members.group_id
          JOIN group_roles ON group_roles.group_id = group_members.group_id
-         WHERE group_members.principal_id = ?
+         WHERE group_members.principal_id = $3
            AND groups.active = 1
-           AND group_roles.role = ?
+           AND group_roles.role = $4
          LIMIT 1",
     )
     .bind(&principal.0)
@@ -186,7 +186,7 @@ async fn is_root_admin(state: &AppState, principal: &AuthedPrincipal) -> ApiResu
     }
 
     // Backwards-compatible fallback for pre-role SQLite files.
-    let row = sqlx::query("SELECT display_name FROM principals WHERE id = ?")
+    let row = sqlx::query("SELECT display_name FROM principals WHERE id = $1")
         .bind(&principal.0)
         .fetch_optional(&state.pool)
         .await
@@ -243,7 +243,7 @@ pub async fn create_principal(
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO principals (id, kind, display_name, external_id, created_at)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(&id)
     .bind(&req.kind)
@@ -291,7 +291,7 @@ pub async fn create_api_key(
 ) -> ApiResult<Json<CreatedApiKey>> {
     ensure_root_admin(&state, &principal).await?;
 
-    let exists = sqlx::query("SELECT id FROM principals WHERE id = ?")
+    let exists = sqlx::query("SELECT id FROM principals WHERE id = $1")
         .bind(&req.principal_id)
         .fetch_optional(&state.pool)
         .await
@@ -306,7 +306,7 @@ pub async fn create_api_key(
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO api_keys (id, principal_id, key_hash, created_at)
-         VALUES (?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&id)
     .bind(&req.principal_id)
@@ -332,7 +332,7 @@ pub async fn set_principal_roles(
 ) -> ApiResult<StatusCode> {
     ensure_root_admin(&state, &principal).await?;
     validate_roles(&req.roles)?;
-    let exists = sqlx::query("SELECT id FROM principals WHERE id = ?")
+    let exists = sqlx::query("SELECT id FROM principals WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.pool)
         .await
@@ -342,13 +342,13 @@ pub async fn set_principal_roles(
         return Err((StatusCode::NOT_FOUND, "principal not found".into()));
     }
 
-    sqlx::query("DELETE FROM principal_roles WHERE principal_id = ?")
+    sqlx::query("DELETE FROM principal_roles WHERE principal_id = $1")
         .bind(&id)
         .execute(&state.pool)
         .await
         .map_err(err500)?;
     for role in req.roles {
-        sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES (?, ?)")
+        sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES ($1, $2)")
             .bind(&id)
             .bind(role)
             .execute(&state.pool)
@@ -366,7 +366,7 @@ pub async fn set_group_roles(
 ) -> ApiResult<StatusCode> {
     ensure_root_admin(&state, &principal).await?;
     validate_roles(&req.roles)?;
-    let exists = sqlx::query("SELECT id FROM groups WHERE id = ?")
+    let exists = sqlx::query("SELECT id FROM groups WHERE id = $1")
         .bind(&id)
         .fetch_optional(&state.pool)
         .await
@@ -376,13 +376,13 @@ pub async fn set_group_roles(
         return Err((StatusCode::NOT_FOUND, "group not found".into()));
     }
 
-    sqlx::query("DELETE FROM group_roles WHERE group_id = ?")
+    sqlx::query("DELETE FROM group_roles WHERE group_id = $1")
         .bind(&id)
         .execute(&state.pool)
         .await
         .map_err(err500)?;
     for role in req.roles {
-        sqlx::query("INSERT INTO group_roles (group_id, role) VALUES (?, ?)")
+        sqlx::query("INSERT INTO group_roles (group_id, role) VALUES ($1, $2)")
             .bind(&id)
             .bind(role)
             .execute(&state.pool)
@@ -413,7 +413,7 @@ pub async fn list_groups(
     for row in rows {
         let group_id: String = row.try_get("id").map_err(err500)?;
         let role_rows =
-            sqlx::query("SELECT role FROM group_roles WHERE group_id = ? ORDER BY role")
+            sqlx::query("SELECT role FROM group_roles WHERE group_id = $1 ORDER BY role")
                 .bind(&group_id)
                 .fetch_all(&state.pool)
                 .await
@@ -443,8 +443,8 @@ pub async fn revoke_api_key(
     ensure_root_admin(&state, &principal).await?;
     let now = Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "UPDATE api_keys SET revoked_at = ?
-         WHERE id = ? AND revoked_at IS NULL",
+        "UPDATE api_keys SET revoked_at = $1
+         WHERE id = $2 AND revoked_at IS NULL",
     )
     .bind(&now)
     .bind(&id)
@@ -460,7 +460,7 @@ pub async fn revoke_api_key(
     Ok(StatusCode::OK)
 }
 
-fn row_to_principal(r: &sqlx::any::AnyRow) -> anyhow::Result<Principal> {
+fn row_to_principal(r: &DbRow) -> anyhow::Result<Principal> {
     Ok(Principal {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,
@@ -471,7 +471,7 @@ fn row_to_principal(r: &sqlx::any::AnyRow) -> anyhow::Result<Principal> {
     })
 }
 
-fn row_to_session(r: &sqlx::any::AnyRow) -> anyhow::Result<AgentSession> {
+fn row_to_session(r: &DbRow) -> anyhow::Result<AgentSession> {
     Ok(AgentSession {
         id: r.try_get("id")?,
         spiffe_id: r.try_get("spiffe_id")?,
@@ -505,7 +505,7 @@ pub async fn admin_summary(
     } else {
         count_owned(
             &state,
-            "SELECT COUNT(*) as c FROM gateways WHERE owner_principal_id = ?",
+            "SELECT COUNT(*) as c FROM gateways WHERE owner_principal_id = $1",
             &principal.0,
         )
         .await?
@@ -513,12 +513,12 @@ pub async fn admin_summary(
     let active_agent_sessions = if is_admin {
         count_bound(
             &state,
-            "SELECT COUNT(*) as c FROM agent_sessions WHERE revoked_at IS NULL AND expires_at > ?",
+            "SELECT COUNT(*) as c FROM agent_sessions WHERE revoked_at IS NULL AND expires_at > $1",
             &now,
         )
         .await?
     } else {
-        count_two_bound(&state, "SELECT COUNT(*) as c FROM agent_sessions WHERE principal_id = ? AND revoked_at IS NULL AND expires_at > ?", &principal.0, &now).await?
+        count_two_bound(&state, "SELECT COUNT(*) as c FROM agent_sessions WHERE principal_id = $1 AND revoked_at IS NULL AND expires_at > $2", &principal.0, &now).await?
     };
     let revoked_agent_sessions = if is_admin {
         count(
@@ -527,7 +527,7 @@ pub async fn admin_summary(
         )
         .await?
     } else {
-        count_owned(&state, "SELECT COUNT(*) as c FROM agent_sessions WHERE principal_id = ? AND revoked_at IS NOT NULL", &principal.0).await?
+        count_owned(&state, "SELECT COUNT(*) as c FROM agent_sessions WHERE principal_id = $1 AND revoked_at IS NOT NULL", &principal.0).await?
     };
     let pending_approvals = if is_admin {
         count(
@@ -538,7 +538,7 @@ pub async fn admin_summary(
     } else {
         count_owned(
             &state,
-            "SELECT COUNT(*) as c FROM approval_requests ar JOIN gateways g ON g.id = ar.gateway_id WHERE g.owner_principal_id = ? AND ar.status = 'pending'",
+            "SELECT COUNT(*) as c FROM approval_requests ar JOIN gateways g ON g.id = ar.gateway_id WHERE g.owner_principal_id = $1 AND ar.status = 'pending'",
             &principal.0,
         ).await?
     };
@@ -551,7 +551,7 @@ pub async fn admin_summary(
     } else {
         count_owned(
             &state,
-            "SELECT COUNT(*) as c FROM tool_fingerprints tf JOIN gateways g ON g.id = tf.gateway_id WHERE g.owner_principal_id = ? AND tf.status = 'pending'",
+            "SELECT COUNT(*) as c FROM tool_fingerprints tf JOIN gateways g ON g.id = tf.gateway_id WHERE g.owner_principal_id = $1 AND tf.status = 'pending'",
             &principal.0,
         ).await?
     };
@@ -560,7 +560,7 @@ pub async fn admin_summary(
     } else {
         count_owned(
             &state,
-            "SELECT COUNT(*) as c FROM audit_events ae JOIN gateways g ON g.id = ae.gateway_id WHERE g.owner_principal_id = ?",
+            "SELECT COUNT(*) as c FROM audit_events ae JOIN gateways g ON g.id = ae.gateway_id WHERE g.owner_principal_id = $1",
             &principal.0,
         ).await?
     };
@@ -621,7 +621,7 @@ pub async fn list_gateways(
     } else {
         sqlx::query(
             "SELECT id, owner_principal_id, hostname, version, last_heartbeat_at
-             FROM gateways WHERE owner_principal_id = ? ORDER BY last_heartbeat_at DESC",
+             FROM gateways WHERE owner_principal_id = $1 ORDER BY last_heartbeat_at DESC",
         )
         .bind(&principal.0)
         .fetch_all(&state.pool)
@@ -658,7 +658,7 @@ pub async fn list_agent_sessions(
         sqlx::query(
             "SELECT id, spiffe_id, principal_id, purpose, public_key_b64,
                     issued_at, expires_at, revoked_at
-             FROM agent_sessions WHERE principal_id = ? ORDER BY issued_at DESC",
+             FROM agent_sessions WHERE principal_id = $1 ORDER BY issued_at DESC",
         )
         .bind(&principal.0)
         .fetch_all(&state.pool)
@@ -690,7 +690,7 @@ pub async fn list_tool_fingerprints(
             "SELECT tf.gateway_id, tf.server_id, tf.tool_name, tf.fingerprint, tf.status,
                     tf.first_seen_at, tf.last_seen_at
              FROM tool_fingerprints tf JOIN gateways g ON g.id = tf.gateway_id
-             WHERE g.owner_principal_id = ? ORDER BY tf.last_seen_at DESC",
+             WHERE g.owner_principal_id = $1 ORDER BY tf.last_seen_at DESC",
         )
         .bind(&principal.0)
         .fetch_all(&state.pool)
@@ -731,7 +731,7 @@ pub async fn list_audit_events(
                 "SELECT id, ts, gateway_id, agent_session_id, principal_id, server_id,
                         tool_name, decision, args_fingerprint, injection_flags,
                         result_bytes, prev_hash, entry_hash
-                 FROM audit_events WHERE gateway_id = ? ORDER BY ts DESC LIMIT ?",
+                 FROM audit_events WHERE gateway_id = $1 ORDER BY ts DESC LIMIT $2",
             )
             .bind(gateway_id)
             .bind(limit)
@@ -743,7 +743,7 @@ pub async fn list_audit_events(
                 "SELECT id, ts, gateway_id, agent_session_id, principal_id, server_id,
                         tool_name, decision, args_fingerprint, injection_flags,
                         result_bytes, prev_hash, entry_hash
-                 FROM audit_events ORDER BY ts DESC LIMIT ?",
+                 FROM audit_events ORDER BY ts DESC LIMIT $1",
             )
             .bind(limit)
             .fetch_all(&state.pool)
@@ -755,8 +755,8 @@ pub async fn list_audit_events(
                         ae.server_id, ae.tool_name, ae.decision, ae.args_fingerprint,
                         ae.injection_flags, ae.result_bytes, ae.prev_hash, ae.entry_hash
                  FROM audit_events ae JOIN gateways g ON g.id = ae.gateway_id
-                 WHERE g.owner_principal_id = ? AND ae.gateway_id = ?
-                 ORDER BY ae.ts DESC LIMIT ?",
+                 WHERE g.owner_principal_id = $1 AND ae.gateway_id = $2
+                 ORDER BY ae.ts DESC LIMIT $3",
             )
             .bind(&principal.0)
             .bind(gateway_id)
@@ -770,7 +770,7 @@ pub async fn list_audit_events(
                         ae.server_id, ae.tool_name, ae.decision, ae.args_fingerprint,
                         ae.injection_flags, ae.result_bytes, ae.prev_hash, ae.entry_hash
                  FROM audit_events ae JOIN gateways g ON g.id = ae.gateway_id
-                 WHERE g.owner_principal_id = ? ORDER BY ae.ts DESC LIMIT ?",
+                 WHERE g.owner_principal_id = $1 ORDER BY ae.ts DESC LIMIT $2",
             )
             .bind(&principal.0)
             .bind(limit)
@@ -811,8 +811,8 @@ pub async fn security_anomalies(
                     result_bytes, prev_hash, entry_hash
              FROM audit_events
              WHERE decision IN ('blocked_injection', 'allowed_flagged')
-                OR COALESCE(result_bytes, 0) >= ?
-             ORDER BY ts DESC LIMIT ?",
+                OR COALESCE(result_bytes, 0) >= $1
+             ORDER BY ts DESC LIMIT $2",
         )
         .bind(large_result_threshold)
         .bind(limit)
@@ -824,10 +824,10 @@ pub async fn security_anomalies(
                     ae.server_id, ae.tool_name, ae.decision, ae.args_fingerprint,
                     ae.injection_flags, ae.result_bytes, ae.prev_hash, ae.entry_hash
              FROM audit_events ae JOIN gateways g ON g.id = ae.gateway_id
-             WHERE g.owner_principal_id = ?
+             WHERE g.owner_principal_id = $1
                AND (ae.decision IN ('blocked_injection', 'allowed_flagged')
-                    OR COALESCE(ae.result_bytes, 0) >= ?)
-             ORDER BY ae.ts DESC LIMIT ?",
+                    OR COALESCE(ae.result_bytes, 0) >= $2)
+             ORDER BY ae.ts DESC LIMIT $3",
         )
         .bind(&principal.0)
         .bind(large_result_threshold)
@@ -885,7 +885,7 @@ pub async fn security_anomalies(
     Ok(Json(out))
 }
 
-fn row_to_audit_event(r: &sqlx::any::AnyRow) -> anyhow::Result<AuditEventView> {
+fn row_to_audit_event(r: &DbRow) -> anyhow::Result<AuditEventView> {
     let flags: String = r.try_get("injection_flags")?;
     Ok(AuditEventView {
         id: r.try_get("id")?,
@@ -923,7 +923,7 @@ pub async fn register_gateway(
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO gateways (id, owner_principal_id, hostname, version, last_heartbeat_at)
-         VALUES (?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT(id) DO UPDATE SET last_heartbeat_at = excluded.last_heartbeat_at,
              version = excluded.version, hostname = excluded.hostname",
     )
@@ -939,7 +939,7 @@ pub async fn register_gateway(
     for up in &req.upstreams {
         sqlx::query(
             "INSERT INTO upstream_inventory (gateway_id, server_id, transport, reported_at)
-             VALUES (?, ?, ?, ?)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT(gateway_id, server_id) DO UPDATE SET
                  transport = excluded.transport, reported_at = excluded.reported_at",
         )
@@ -968,7 +968,7 @@ pub async fn get_policy(
 
     let row = sqlx::query(
         "SELECT scope, version, bundle_json FROM policy_bundles
-         WHERE scope = ? ORDER BY version DESC LIMIT 1",
+         WHERE scope = $1 ORDER BY version DESC LIMIT 1",
     )
     .bind(&scope)
     .fetch_optional(&state.pool)
@@ -999,7 +999,7 @@ pub async fn put_policy(
     ensure_scope_owner(&state, &principal, &req.scope).await?;
 
     let next_version_row =
-        sqlx::query("SELECT COALESCE(MAX(version), 0) as v FROM policy_bundles WHERE scope = ?")
+        sqlx::query("SELECT COALESCE(MAX(version), 0) as v FROM policy_bundles WHERE scope = $1")
             .bind(&req.scope)
             .fetch_one(&state.pool)
             .await
@@ -1012,7 +1012,7 @@ pub async fn put_policy(
 
     sqlx::query(
         "INSERT INTO policy_bundles (id, scope, version, bundle_json, created_at, created_by)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&id)
     .bind(&req.scope)
@@ -1045,7 +1045,7 @@ pub async fn report_tool_fingerprint(
     let now = Utc::now().to_rfc3339();
     let existing = sqlx::query(
         "SELECT fingerprint, status FROM tool_fingerprints
-         WHERE gateway_id = ? AND server_id = ? AND tool_name = ?",
+         WHERE gateway_id = $1 AND server_id = $2 AND tool_name = $3",
     )
     .bind(&req.gateway_id)
     .bind(&req.server_id)
@@ -1072,7 +1072,7 @@ pub async fn report_tool_fingerprint(
     sqlx::query(
         "INSERT INTO tool_fingerprints
              (gateway_id, server_id, tool_name, fingerprint, status, first_seen_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT(gateway_id, server_id, tool_name) DO UPDATE SET
              fingerprint = excluded.fingerprint, status = excluded.status,
              last_seen_at = excluded.last_seen_at",
@@ -1107,7 +1107,7 @@ pub async fn approve_tool_fingerprint(
 
     let result = sqlx::query(
         "UPDATE tool_fingerprints SET status = 'approved'
-         WHERE gateway_id = ? AND server_id = ? AND tool_name = ?",
+         WHERE gateway_id = $1 AND server_id = $2 AND tool_name = $3",
     )
     .bind(&req.gateway_id)
     .bind(&req.server_id)
@@ -1142,7 +1142,7 @@ pub async fn create_approval(
         "INSERT INTO approval_requests
              (id, gateway_id, agent_session_id, server_id, tool_name, args_fingerprint,
               risk_tier, status, requested_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
     )
     .bind(&id)
     .bind(&req.gateway_id)
@@ -1185,7 +1185,7 @@ pub async fn list_approvals(
         sqlx::query(
             "SELECT ar.* FROM approval_requests ar
              JOIN gateways g ON g.id = ar.gateway_id
-             WHERE g.owner_principal_id = ? AND ar.status = ?
+             WHERE g.owner_principal_id = $1 AND ar.status = $2
              ORDER BY ar.requested_at DESC",
         )
         .bind(&principal.0)
@@ -1196,7 +1196,7 @@ pub async fn list_approvals(
         sqlx::query(
             "SELECT ar.* FROM approval_requests ar
              JOIN gateways g ON g.id = ar.gateway_id
-             WHERE g.owner_principal_id = ?
+             WHERE g.owner_principal_id = $1
              ORDER BY ar.requested_at DESC",
         )
         .bind(&principal.0)
@@ -1231,9 +1231,9 @@ pub async fn decide_approval(
 
     let result = sqlx::query(
         "UPDATE approval_requests
-         SET status = ?, decided_at = ?, decided_by = ?, reason = ?
-         WHERE id = ? AND status = 'pending'
-           AND gateway_id IN (SELECT id FROM gateways WHERE owner_principal_id = ?)",
+         SET status = $1, decided_at = $2, decided_by = $3, reason = $4
+         WHERE id = $5 AND status = 'pending'
+           AND gateway_id IN (SELECT id FROM gateways WHERE owner_principal_id = $6)",
     )
     .bind(status)
     .bind(&now)
@@ -1270,7 +1270,7 @@ async fn fetch_approval_for_principal(
     let row = sqlx::query(
         "SELECT ar.* FROM approval_requests ar
          JOIN gateways g ON g.id = ar.gateway_id
-         WHERE ar.id = ? AND g.owner_principal_id = ?",
+         WHERE ar.id = $1 AND g.owner_principal_id = $2",
     )
     .bind(id)
     .bind(&principal.0)
@@ -1283,7 +1283,7 @@ async fn fetch_approval_for_principal(
     }
 }
 
-fn row_to_approval(r: &sqlx::any::AnyRow) -> anyhow::Result<ApprovalRequest> {
+fn row_to_approval(r: &DbRow) -> anyhow::Result<ApprovalRequest> {
     Ok(ApprovalRequest {
         id: r.try_get("id")?,
         gateway_id: r.try_get("gateway_id")?,
@@ -1364,7 +1364,7 @@ pub async fn ingest_audit(
             "INSERT INTO audit_events
                  (id, ts, gateway_id, agent_session_id, principal_id, server_id, tool_name,
                   decision, args_fingerprint, injection_flags, result_bytes, prev_hash, entry_hash)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&id)
         .bind(&now)
@@ -1410,19 +1410,72 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
     let mut expected_prev = GENESIS_HASH.to_string();
 
     for r in rows {
-        let id: String = r.try_get("id").unwrap_or_default();
-        let ts: String = r.try_get("ts").unwrap_or_default();
-        let gateway_id: String = r.try_get("gateway_id").unwrap_or_default();
-        let agent_session_id: Option<String> = r.try_get("agent_session_id").ok().flatten();
-        let principal_id: Option<String> = r.try_get("principal_id").ok().flatten();
-        let server_id: String = r.try_get("server_id").unwrap_or_default();
-        let tool_name: String = r.try_get("tool_name").unwrap_or_default();
-        let decision: String = r.try_get("decision").unwrap_or_default();
-        let args_fingerprint: String = r.try_get("args_fingerprint").unwrap_or_default();
-        let injection_flags: String = r.try_get("injection_flags").unwrap_or_default();
-        let result_bytes: Option<i64> = r.try_get("result_bytes").ok();
-        let prev_hash: String = r.try_get("prev_hash").unwrap_or_default();
-        let entry_hash: String = r.try_get("entry_hash").unwrap_or_default();
+        let id: String = match r.try_get("id") {
+            Ok(value) => value,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "audit row has an invalid id column",
+                    "error": e.to_string()
+                }))
+            }
+        };
+        let decode_error = |column: &str, error: sqlx::Error| {
+            Json(serde_json::json!({
+                "ok": false,
+                "broken_at_id": id,
+                "reason": format!("audit row has an invalid {column} column"),
+                "error": error.to_string()
+            }))
+        };
+        let ts: String = match r.try_get("ts") {
+            Ok(value) => value,
+            Err(e) => return decode_error("ts", e),
+        };
+        let gateway_id: String = match r.try_get("gateway_id") {
+            Ok(value) => value,
+            Err(e) => return decode_error("gateway_id", e),
+        };
+        let agent_session_id: Option<String> = match r.try_get("agent_session_id") {
+            Ok(value) => value,
+            Err(e) => return decode_error("agent_session_id", e),
+        };
+        let principal_id: String = match r.try_get("principal_id") {
+            Ok(value) => value,
+            Err(e) => return decode_error("principal_id", e),
+        };
+        let server_id: String = match r.try_get("server_id") {
+            Ok(value) => value,
+            Err(e) => return decode_error("server_id", e),
+        };
+        let tool_name: String = match r.try_get("tool_name") {
+            Ok(value) => value,
+            Err(e) => return decode_error("tool_name", e),
+        };
+        let decision: String = match r.try_get("decision") {
+            Ok(value) => value,
+            Err(e) => return decode_error("decision", e),
+        };
+        let args_fingerprint: String = match r.try_get("args_fingerprint") {
+            Ok(value) => value,
+            Err(e) => return decode_error("args_fingerprint", e),
+        };
+        let injection_flags: String = match r.try_get("injection_flags") {
+            Ok(value) => value,
+            Err(e) => return decode_error("injection_flags", e),
+        };
+        let result_bytes: Option<i64> = match r.try_get("result_bytes") {
+            Ok(value) => value,
+            Err(e) => return decode_error("result_bytes", e),
+        };
+        let prev_hash: String = match r.try_get("prev_hash") {
+            Ok(value) => value,
+            Err(e) => return decode_error("prev_hash", e),
+        };
+        let entry_hash: String = match r.try_get("entry_hash") {
+            Ok(value) => value,
+            Err(e) => return decode_error("entry_hash", e),
+        };
 
         // Check 1: does this row's stored prev_hash actually match the
         // previous row's entry_hash? This is the check the original version
@@ -1445,7 +1498,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             ts,
             gateway_id,
             agent_session_id.as_deref().unwrap_or(""),
-            principal_id.as_deref().unwrap_or(""),
+            principal_id,
             server_id,
             tool_name,
             decision,
@@ -1506,7 +1559,7 @@ pub async fn mint_agent_session(
     sqlx::query(
         "INSERT INTO agent_sessions
              (id, spiffe_id, principal_id, purpose, public_key_b64, issued_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&id)
     .bind(&spiffe_id)
@@ -1540,7 +1593,7 @@ pub async fn issue_token(
 
     let row = sqlx::query(
         "SELECT spiffe_id, principal_id, public_key_b64, expires_at, revoked_at
-         FROM agent_sessions WHERE id = ?",
+         FROM agent_sessions WHERE id = $1",
     )
     .bind(&req.agent_session_id)
     .fetch_optional(&state.pool)
@@ -1607,8 +1660,8 @@ pub async fn revoke_agent_session(
 ) -> ApiResult<StatusCode> {
     let now = Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "UPDATE agent_sessions SET revoked_at = ?
-         WHERE id = ? AND principal_id = ? AND revoked_at IS NULL",
+        "UPDATE agent_sessions SET revoked_at = $1
+         WHERE id = $2 AND principal_id = $3 AND revoked_at IS NULL",
     )
     .bind(&now)
     .bind(&id)
@@ -1650,7 +1703,7 @@ pub async fn set_org_policy(
         })?;
 
     let next_version_row =
-        sqlx::query("SELECT COALESCE(MAX(version), 0) as v FROM org_policies WHERE scope = ?")
+        sqlx::query("SELECT COALESCE(MAX(version), 0) as v FROM org_policies WHERE scope = $1")
             .bind(&scope)
             .fetch_one(&state.pool)
             .await
@@ -1661,7 +1714,7 @@ pub async fn set_org_policy(
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO org_policies (id, scope, version, rego_source, created_at, created_by)
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&id)
     .bind(&scope)
@@ -1689,7 +1742,7 @@ pub async fn get_org_policy(
 
     let row = sqlx::query(
         "SELECT scope, version, rego_source FROM org_policies
-         WHERE scope = ? ORDER BY version DESC LIMIT 1",
+         WHERE scope = $1 ORDER BY version DESC LIMIT 1",
     )
     .bind(&scope)
     .fetch_optional(&state.pool)

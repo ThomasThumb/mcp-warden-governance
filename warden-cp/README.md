@@ -55,19 +55,24 @@ Use SQLite for local development, single-machine demos, and throwaway tests.
 Use Postgres for anything you care about: multiple gateways, durable audit
 history, backups, reporting, HA planning, or admin/security review.
 
-`DATABASE_URL=sqlite://warden-cp.db` (default) or
-`DATABASE_URL=postgres://user:pass@host/db` - same code path either way via
-sqlx's `Any` driver. The honest tradeoff: hand-written SQL instead of sqlx's
-`query!` compile-time checking. Once Postgres is the only production backend,
-split `db.rs` into a real repository trait with a Postgres-specific
-implementation to get compile-time-checked queries and database-native
-migrations back. The handler code in `routes.rs` should not need to change.
+The binary is built for exactly one SQL backend at a time. The default feature
+is SQLite for local development:
 
-Dependency-audit note: sqlx 0.8's `Any` feature resolves the optional
-`sqlx-mysql` package into `Cargo.lock` even though this service enables only
-SQLite and Postgres drivers at runtime. `cargo tree -i sqlx-mysql --target all`
-should print `nothing to print`; if you ever enable MySQL, treat the
-RUSTSEC-2023-0071 `rsa` advisory as real until SQLx ships a fixed path.
+```bash
+DATABASE_URL=sqlite://warden-cp.db cargo run
+```
+
+Production builds should use the Postgres feature:
+
+```bash
+DATABASE_URL=postgres://user:pass@host/db \
+  cargo run --no-default-features --features postgres
+```
+
+This is deliberate. SQLx's runtime `Any` driver resolves unused optional
+drivers into `Cargo.lock`, which makes dependency-audit output noisy and less
+trustworthy. Feature-specific builds keep the lockfile and binary surface to
+SQLite/Postgres only; MySQL/RSA is not pulled in.
 
 ### Postgres quick start
 
@@ -90,6 +95,28 @@ monitored like production security infrastructure.
 TLS/private-ingress examples live in `deploy/caddy/`. The Caddy example keeps
 `warden-cp` on localhost behind HTTPS and documents the Go TLS hybrid
 ML-KEM behavior to verify in your chosen Caddy build.
+
+## Verification
+
+Run the dependency/build checks without advisory ignores:
+
+```powershell
+.\scripts\verify_audit_clean.ps1
+```
+
+That checks the default SQLite control-plane build, the production Postgres
+control-plane build, raw `cargo audit` for `warden-cp`, and raw `cargo audit`
+for the gateway.
+
+Run the concrete Caddy hybrid-PQ TLS proof:
+
+```powershell
+.\scripts\verify_caddy_hybrid_pq_tls.ps1
+```
+
+The proof starts a disposable Caddy container, uses a Go 1.26 client restricted
+to `X25519MLKEM768`, and fails unless the negotiated TLS group is exactly
+`X25519MLKEM768`.
 
 ## PQC posture
 

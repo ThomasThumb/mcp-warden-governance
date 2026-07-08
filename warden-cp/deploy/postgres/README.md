@@ -4,6 +4,10 @@ This profile runs `warden-cp` against Postgres instead of the local SQLite
 default. It is suitable for a small production pilot when fronted by TLS and
 backed up properly.
 
+The Dockerfile builds `warden-cp` with `--no-default-features --features
+postgres`, so the production image does not include the SQLite backend or
+SQLx's runtime `Any` driver.
+
 ## Start
 
 ```bash

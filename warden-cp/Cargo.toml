@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "Control plane for mcp-warden: inventory, allowlists/drift, scoped identity, audit + approvals"
 
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-# "Any" driver lets the same code run on SQLite (default, small teams) or
-# Postgres (enterprise) by just changing the connection URL's scheme -
-# trades sqlx's compile-time query! checking for that portability. See
-# README "Storage" for the tradeoff and how to move to a backend-specific
-# pool later if you want the compile-time checking back.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "any", "sqlite", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
