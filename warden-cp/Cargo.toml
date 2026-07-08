@@ -29,4 +29,4 @@ base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 regorus = { version = "0.10.1", default-features = false, features = ["opa-no-std"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
