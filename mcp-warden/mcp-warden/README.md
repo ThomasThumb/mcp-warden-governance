@@ -161,7 +161,7 @@ If `[control_plane]` is set in `warden.toml`, this gateway now:
 
 ```toml
 [control_plane]
-url = "http://localhost:7878"
+url = "https://localhost:7878"
 gateway_id = "laptop-jane"
 owner_principal_id = "principal-uuid-here"
 max_degraded_minutes = 60   # just documents the default you'd pass to confirm-degraded
@@ -172,6 +172,10 @@ require_agent_token = true
 require_agent_proof = true
 require_token_introspection = true
 ```
+
+Use `http://localhost:7878` only for same-host development. For anything across
+a network, point the gateway at `https://...`; `warden-cp` can now serve
+built-in TLS or enforce HTTPS behind a trusted reverse proxy.
 
 `require_agent_proof = true` now requires `require_token_introspection = true`.
 That is intentional: a proof over `token + args_fingerprint` is replayable if

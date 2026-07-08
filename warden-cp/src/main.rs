@@ -8,11 +8,12 @@ mod notify;
 mod oidc;
 mod routes;
 mod scim;
+mod transport;
 
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::Router;
-use routes::{AppState, AuditChainTail};
+use routes::{AppState, AuditChainTail, TransportSecurity};
 use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -48,7 +49,20 @@ async fn load_chain_tail(pool: &db::DbPool) -> AuditChainTail {
     }
 }
 
-fn enforce_safe_bind_addr(bind_addr: &str) -> anyhow::Result<()> {
+fn enforce_transport_security(bind_addr: &str, security: &TransportSecurity) -> anyhow::Result<()> {
+    if security.tls_enabled {
+        return Ok(());
+    }
+    if security.require_https && security.trust_proxy_headers && is_loopback_bind(bind_addr) {
+        return Ok(());
+    }
+    if security.require_https {
+        anyhow::bail!(
+            "WARDEN_CP_REQUIRE_HTTPS=true but TLS_CERT_PATH/TLS_KEY_PATH are not set; \
+             enable built-in TLS or terminate HTTPS at a trusted reverse proxy and set \
+             WARDEN_CP_TRUST_PROXY_HEADERS=true while binding warden-cp to loopback"
+        );
+    }
     if is_loopback_bind(bind_addr) || truthy_env("WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK") {
         return Ok(());
     }
@@ -82,6 +96,28 @@ fn audit_ml_dsa_checkpoint_interval() -> i64 {
         .unwrap_or(1)
 }
 
+fn transport_security_from_env(tls_enabled: bool) -> TransportSecurity {
+    TransportSecurity {
+        tls_enabled,
+        require_https: truthy_env("WARDEN_CP_REQUIRE_HTTPS"),
+        trust_proxy_headers: truthy_env("WARDEN_CP_TRUST_PROXY_HEADERS"),
+    }
+}
+
+fn tls_paths_from_env() -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let cert = std::env::var("TLS_CERT_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let key = std::env::var("TLS_KEY_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some((PathBuf::from(cert), PathBuf::from(key)))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("TLS_CERT_PATH and TLS_KEY_PATH must be set together"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -89,7 +125,9 @@ async fn main() -> anyhow::Result<()> {
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://warden-cp.db".to_string());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
-    enforce_safe_bind_addr(&bind_addr)?;
+    let tls_paths = tls_paths_from_env()?;
+    let transport_security = transport_security_from_env(tls_paths.is_some());
+    enforce_transport_security(&bind_addr, &transport_security)?;
     let webhook_url = std::env::var("APPROVAL_WEBHOOK_URL").ok();
     let trust_domain = std::env::var("TRUST_DOMAIN").unwrap_or_else(|_| "warden.local".to_string());
     let signing_key_path = PathBuf::from(
@@ -130,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         audit_chain_tail: Arc::new(AsyncMutex::new(chain_tail)),
         audit_anchor,
         audit_ml_dsa_checkpoint_interval,
+        transport_security,
         rate_limits: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
@@ -226,10 +265,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/oidc/login", get(oidc::login))
         .route("/oidc/callback", get(oidc::callback))
         .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            routes::require_https,
+        ))
         .with_state(state);
 
-    tracing::info!("warden-cp listening on {bind_addr}");
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    transport::serve_app(&bind_addr, app, tls_paths).await
 }

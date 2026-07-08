@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Html,
     Json,
 };
@@ -45,8 +45,16 @@ pub struct AppState {
     /// interval exists only for deployments that deliberately accept periodic
     /// PQ checkpoints plus an external anchor at very high volume.
     pub audit_ml_dsa_checkpoint_interval: i64,
+    pub transport_security: TransportSecurity,
     /// Sliding-window rate limiter: principal_id -> request timestamps.
     pub rate_limits: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+#[derive(Clone)]
+pub struct TransportSecurity {
+    pub tls_enabled: bool,
+    pub require_https: bool,
+    pub trust_proxy_headers: bool,
 }
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -85,6 +93,54 @@ pub async fn rate_limit(
         hits.push_back(now);
     }
     Ok(next.run(req).await)
+}
+
+pub async fn require_https(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if !state.transport_security.require_https || request_is_secure(&state, req.headers()) {
+        return Ok(next.run(req).await);
+    }
+    Err(StatusCode::UPGRADE_REQUIRED)
+}
+
+fn request_is_secure(state: &AppState, headers: &HeaderMap) -> bool {
+    state.transport_security.tls_enabled
+        || (state.transport_security.trust_proxy_headers && forwarded_proto_is_https(headers))
+}
+
+fn forwarded_proto_is_https(headers: &HeaderMap) -> bool {
+    header_first_value(headers, "x-forwarded-proto")
+        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
+        || header_first_value(headers, "x-forwarded-ssl")
+            .is_some_and(|value| value.eq_ignore_ascii_case("on"))
+        || headers
+            .get_all("forwarded")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|part| {
+                part.split(';').any(|kv| {
+                    let Some((name, value)) = kv.trim().split_once('=') else {
+                        return false;
+                    };
+                    name.trim().eq_ignore_ascii_case("proto")
+                        && value.trim_matches('"').eq_ignore_ascii_case("https")
+                })
+            })
+}
+
+fn header_first_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub async fn admin_dashboard() -> Html<&'static str> {
@@ -2413,5 +2469,42 @@ pub async fn get_org_policy(
             StatusCode::NOT_FOUND,
             format!("no org policy for scope '{scope}'"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn forwarded_proto_https_is_accepted() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=1.2.3.4;proto=https"),
+        );
+        assert!(forwarded_proto_is_https(&headers));
+    }
+
+    #[test]
+    fn x_forwarded_proto_uses_first_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https, http"));
+        assert!(forwarded_proto_is_https(&headers));
+
+        let mut downgraded = HeaderMap::new();
+        downgraded.insert("x-forwarded-proto", HeaderValue::from_static("http, https"));
+        assert!(!forwarded_proto_is_https(&downgraded));
+    }
+
+    #[test]
+    fn forwarded_proto_http_is_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=1.2.3.4;proto=http"),
+        );
+        assert!(!forwarded_proto_is_https(&headers));
     }
 }

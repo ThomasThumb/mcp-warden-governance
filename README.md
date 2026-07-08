@@ -10,8 +10,8 @@ Protocol deployments.
 
 The project is security-first: default-deny tool policy, tool fingerprinting,
 short-lived per-tool tokens, proof-of-possession, hybrid Ed25519 + ML-DSA
-signatures, audit-chain verification, external audit anchoring, and production
-hooks for KMS/HSM/OS-keystore-backed signing.
+signatures, audit-chain verification, external audit anchoring, built-in TLS /
+HTTPS enforcement, and production hooks for KMS/HSM/OS-keystore-backed signing.
 
 ## Quick Start
 

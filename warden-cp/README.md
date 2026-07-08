@@ -87,17 +87,47 @@ cp .env.example .env
 docker compose --env-file .env up --build
 ```
 
-For non-local deployment, keep `warden-cp` bound to localhost behind a TLS
-1.3 reverse proxy or private network ingress. The binary refuses non-loopback
-plaintext binds unless `WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK=true` is set
-explicitly for a trusted private test network. Prefer a provider/stack with
-hybrid ML-KEM key establishment where available. Postgres should be backed up
-with normal database tooling (`pg_dump`, managed-service PITR, or storage
+For non-local deployment, run `warden-cp` with built-in TLS or keep it bound
+to localhost behind a TLS 1.3 reverse proxy/private ingress. The binary refuses
+non-loopback plaintext binds unless `WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK=true`
+is set explicitly for a trusted private test network. Prefer a provider/stack
+with hybrid ML-KEM key establishment where available. Postgres should be backed
+up with normal database tooling (`pg_dump`, managed-service PITR, or storage
 snapshots) and monitored like production security infrastructure.
 
 TLS/private-ingress examples live in `deploy/caddy/`. The Caddy example keeps
 `warden-cp` on localhost behind HTTPS and documents the Go TLS hybrid
 ML-KEM behavior to verify in your chosen Caddy build.
+
+### Transport encryption and HTTPS enforcement
+
+Local development can use plaintext loopback:
+
+```bash
+export BIND_ADDR="127.0.0.1:7878"
+```
+
+Production should use built-in Rustls TLS:
+
+```bash
+export BIND_ADDR="0.0.0.0:7878"
+export TLS_CERT_PATH="/etc/warden-cp/tls/fullchain.pem"
+export TLS_KEY_PATH="/etc/warden-cp/tls/privkey.pem"
+export WARDEN_CP_REQUIRE_HTTPS=true
+```
+
+Or terminate HTTPS at a trusted local reverse proxy:
+
+```bash
+export BIND_ADDR="127.0.0.1:7878"
+export WARDEN_CP_REQUIRE_HTTPS=true
+export WARDEN_CP_TRUST_PROXY_HEADERS=true
+```
+
+When `WARDEN_CP_REQUIRE_HTTPS=true`, requests must arrive over built-in TLS or
+carry trusted reverse-proxy `Forwarded: proto=https` / `X-Forwarded-Proto:
+https` metadata. Only enable `WARDEN_CP_TRUST_PROXY_HEADERS` when direct client
+traffic cannot reach `warden-cp`; otherwise a client could spoof those headers.
 
 ## Verification
 
@@ -205,6 +235,9 @@ Key holes from v0.1 are fixed:
   domain-separated, length-prefixed hashing with a monotonic sequence number
   and a control-plane-signed checkpoint. `/v1/audit/verify` streams rows and
   verifies both the chain and the signatures.
+- **Transport now has explicit HTTPS controls.** `warden-cp` supports built-in
+  Rustls TLS and can require HTTPS either directly or through trusted
+  reverse-proxy headers.
 
 Plus: agent-session revocation (`POST /v1/agent-sessions/:id/revoke`),
 hash-chained audit log with a verify endpoint (`GET /v1/audit/verify`), a
