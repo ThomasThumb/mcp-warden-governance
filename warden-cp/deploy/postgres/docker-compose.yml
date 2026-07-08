@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-warden_cp}
+      POSTGRES_USER: ${POSTGRES_USER:-warden_cp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - warden_cp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-warden_cp} -d ${POSTGRES_DB:-warden_cp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  warden-cp:
+    build:
+      context: ../..
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-warden_cp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-warden_cp}
+      BIND_ADDR: 0.0.0.0:7878
+      TRUST_DOMAIN: ${TRUST_DOMAIN:-warden.local}
+      SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-/var/lib/warden-cp/warden-cp-signing.key}
+      APPROVAL_WEBHOOK_URL: ${APPROVAL_WEBHOOK_URL:-}
+    ports:
+      - "${WARDEN_CP_BIND:-127.0.0.1:7878}:7878"
+    volumes:
+      - warden_cp_state:/var/lib/warden-cp
+
+volumes:
+  warden_cp_pgdata:
+  warden_cp_state:

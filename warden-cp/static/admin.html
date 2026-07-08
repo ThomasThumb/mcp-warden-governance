@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>warden-cp admin</title>
+  <style>
+    :root { color-scheme: light dark; font-family: Segoe UI, system-ui, sans-serif; }
+    body { margin: 0; padding: 24px; background: Canvas; color: CanvasText; }
+    main { max-width: 1120px; margin: 0 auto; }
+    h1 { font-size: 24px; margin: 0 0 16px; }
+    h2 { font-size: 18px; margin: 28px 0 10px; }
+    form { display: flex; gap: 8px; margin-bottom: 18px; }
+    input { flex: 1; padding: 9px 10px; }
+    button { padding: 9px 12px; cursor: pointer; }
+    pre { overflow: auto; padding: 12px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .metric { border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); padding: 12px; }
+    .metric strong { display: block; font-size: 22px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>warden-cp admin</h1>
+    <form id="auth">
+      <input id="key" type="password" autocomplete="off" placeholder="Bearer API key">
+      <button type="submit">Load</button>
+    </form>
+    <section>
+      <h2>Summary</h2>
+      <div id="summary" class="grid"></div>
+    </section>
+    <section>
+      <h2>Pending Approvals</h2>
+      <pre id="approvals">[]</pre>
+    </section>
+    <section>
+      <h2>Security Anomalies</h2>
+      <pre id="anomalies">[]</pre>
+    </section>
+    <section>
+      <h2>Recent Audit Events</h2>
+      <pre id="audit">[]</pre>
+    </section>
+  </main>
+  <script>
+    async function api(path, key) {
+      const response = await fetch(path, { headers: { Authorization: `Bearer ${key}` } });
+      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+      return response.json();
+    }
+    function renderSummary(data) {
+      const root = document.querySelector("#summary");
+      root.textContent = "";
+      for (const [key, value] of Object.entries(data)) {
+        const item = document.createElement("div");
+        item.className = "metric";
+        item.innerHTML = `<span>${key}</span><strong>${value}</strong>`;
+        root.appendChild(item);
+      }
+    }
+    document.querySelector("#auth").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const key = document.querySelector("#key").value;
+      renderSummary(await api("/v1/admin/summary", key));
+      document.querySelector("#approvals").textContent =
+        JSON.stringify(await api("/v1/approvals?status=pending", key), null, 2);
+      document.querySelector("#anomalies").textContent =
+        JSON.stringify(await api("/v1/security/anomalies?limit=50", key), null, 2);
+      document.querySelector("#audit").textContent =
+        JSON.stringify(await api("/v1/audit/events?limit=50", key), null, 2);
+    });
+  </script>
+</body>
+</html>

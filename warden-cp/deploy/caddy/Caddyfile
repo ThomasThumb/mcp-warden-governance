@@ -1,0 +1,17 @@
+{
+	# Keep Caddy current. Caddy builds on Go's crypto/tls; Go 1.24+ defaults
+	# include X25519MLKEM768 hybrid key exchange when available.
+	email admin@example.com
+}
+
+warden-cp.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:7878
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+}

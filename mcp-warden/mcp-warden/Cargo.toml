@@ -1,0 +1,31 @@
+[package]
+name = "mcp-warden"
+version = "0.1.0"
+edition = "2021"
+description = "A zero-trust security and governance proxy for MCP servers"
+
+[dependencies]
+# Official Rust MCP SDK. We deliberately skip the "macros" feature: this gateway
+# proxies a *dynamic* tool set discovered at runtime from upstream servers, so we
+# implement ServerHandler/ClientHandler by hand instead of the static #[tool] macros.
+rmcp = { version = "2", default-features = false, features = [
+    "server",
+    "client",
+    "transport-child-process",
+    "transport-io",
+] }
+tokio = { version = "1", features = ["full"] }
+regorus = { version = "0.10.1", default-features = false, features = ["opa-no-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+regex = "1"
+anyhow = "1"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+base64 = "0.22"
+ed25519-dalek = "2"

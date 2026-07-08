@@ -1,0 +1,93 @@
+# Copy this to warden.toml (or point MCP_WARDEN_CONFIG at your own path) and
+# point your MCP host (Claude Desktop, etc.) at the mcp-warden binary instead
+# of your real servers directly. mcp-warden becomes "the" MCP server the host
+# sees; it fans out to everything declared below.
+
+state_dir = "~/.mcp-warden"   # tool-hash store, pending approvals, audit.jsonl
+
+# Optional. Without this, every RequireApproval tool stays exactly that -
+# no auto-approve path exists unless you opt in. See warden.example.rego.
+rego_policy_path = "warden.rego"
+
+# Optional. Remove this whole section for solo/offline use - the gateway
+# works exactly as before with no control plane configured at all.
+[control_plane]
+url = "http://localhost:7878"
+gateway_id = "laptop-jane"
+owner_principal_id = "replace-with-a-real-principal-id"
+api_key = "paste-the-key-warden-cp-printed-on-first-run-here"
+max_degraded_minutes = 60
+# Optional if the control plane is reachable at startup; the gateway will fetch
+# /v1/signer/public-key. Set it explicitly for degraded/offline verification.
+signer_public_key_b64 = "paste-ed25519-public-key-from-warden-cp"
+# Zero-trust default. Every tools/call must carry a scoped token in
+# _meta.warden_token, or arguments.__warden_token for older clients.
+require_agent_token = true
+# Also require _meta.warden_proof or arguments.__warden_proof: an Ed25519
+# signature by the agent-session key over:
+#   warden-pop-v1\n<token>\n<args_fingerprint>
+require_agent_proof = true
+
+[injection_filter]
+scan_tool_descriptions = true
+scan_results = true
+block_threshold = 3           # heuristic rule hits before a call is blocked outright
+
+# --- A local filesystem server: mostly read-only, one destructive tool ---
+[[servers]]
+id = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"]
+default_risk = "require_approval"   # anything not listed below needs a human yes
+
+[servers.sandbox]
+mode = "bubblewrap"                 # none | bubblewrap | firejail | docker
+workspace = "/home/you/projects"
+allow_network = false
+
+[servers.tools.read_file]
+risk = "read_only"
+[servers.tools.list_directory]
+risk = "read_only"
+[servers.tools.write_file]
+risk = "require_approval"
+[servers.tools.delete_file]
+blocked = true                      # never allowed, full stop, no matter what asks
+
+# --- A GitHub server: this is the "GitHub MCP data heist" scenario from
+# earlier - use a fine-grained, repo-scoped token in GITHUB_TOKEN, not a
+# classic full-access PAT, regardless of what mcp-warden does on top ---
+[[servers]]
+id = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+default_risk = "require_approval"
+
+[servers.env]
+GITHUB_TOKEN = "" # set via your shell/secret manager, don't commit a real one
+
+[servers.tools.search_issues]
+risk = "read_only"
+[servers.tools.get_file_contents]
+risk = "read_only"
+[servers.tools.create_issue]
+risk = "require_approval"
+[servers.tools.push_files]
+risk = "require_approval"
+
+# --- A remote HTTP MCP server. The gateway obtains the upstream token; it
+# never forwards the host's bearer token.
+[[servers]]
+id = "remote-docs"
+transport = "http"
+url = "https://mcp.example.com/rpc"
+default_risk = "read_only"
+
+[servers.oauth]
+token_url = "https://auth.example.com/oauth/token"
+client_id_env = "REMOTE_DOCS_CLIENT_ID"
+client_secret_env = "REMOTE_DOCS_CLIENT_SECRET"
+resource = "https://mcp.example.com/rpc"
+scope = "mcp:call"
