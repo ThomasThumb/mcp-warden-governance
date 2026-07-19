@@ -25,10 +25,11 @@ COPY mcp-warden mcp-warden
 RUN touch warden-cp/src/main.rs \
     && cargo build --release --locked -p warden-cp --no-default-features --features postgres
 
-# Distroless provides only the dynamic C runtime, CA roots, and timezone data
-# needed by the Rust binary: no package manager, shell, Perl, or login tools.
-# The nonroot image's stable numeric identity is 65532:65532.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa
+# Chainguard's minimal Wolfi runtime provides only the dynamic C runtime and
+# CA roots needed by the Rust binary: no package manager, shell, Perl, or
+# login tools. Its stable nonroot identity is 65532:65532. Keep both the tag
+# (so Dependabot can identify the image) and immutable multi-platform digest.
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:7ff79e2caef2b8a137ddaf9940fb790e91148482092363760d6661e4591fd54c
 COPY --chown=65532:65532 LICENSE /var/lib/warden-cp/LICENSE
 WORKDIR /var/lib/warden-cp
 COPY --from=build --chown=65532:65532 /src/target/release/warden-cp /usr/local/bin/warden-cp

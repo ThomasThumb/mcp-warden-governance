@@ -1,7 +1,8 @@
 services:
   postgres:
-    # Preserve PostgreSQL 17 storage compatibility while rebuilding its gosu
-    # helper with a patched Go runtime; both base images are digest-pinned.
+    # Preserve PostgreSQL 17 storage compatibility while omitting unused
+    # XML/XSLT runtime parsers and rebuilding gosu with patched dependencies.
+    # Every source and base image is checksum- or digest-pinned.
     image: warden-cp-postgres:17.10-hardened
     build:
       context: ../../..

@@ -81,9 +81,10 @@ SQLite/Postgres only; MySQL/RSA is not pulled in.
 The repo includes a minimal Postgres deployment under `deploy/postgres/`.
 It keeps Postgres on an internal-only network and binds `warden-cp` to
 localhost by default. The deployment preserves PostgreSQL 17 data compatibility
-and rebuilds its small `gosu` privilege-drop helper with a fixed, digest-pinned
-Go toolchain; CI scans both resulting images and fails on any vulnerability or
-embedded secret.
+while compiling out unused XML/XSLT support and rebuilding its small `gosu`
+privilege-drop helper with a fixed, digest-pinned Go toolchain. PostgreSQL's
+source archive is checksum-verified; CI scans both resulting images and fails
+on any vulnerability or embedded secret.
 
 ```bash
 cd deploy/postgres

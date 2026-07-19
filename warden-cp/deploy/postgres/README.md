@@ -8,6 +8,12 @@ The Dockerfile builds `warden-cp` with `--no-default-features --features
 postgres`, so the production image does not include the SQLite backend or
 SQLx's runtime `Any` driver.
 
+The database image preserves PostgreSQL 17 on-disk compatibility but builds
+17.10 from its checksum-verified upstream source with only the OpenSSL and zlib
+features this service needs. Unused XML/XSLT, ICU, LDAP, GSSAPI, LLVM, and
+language-extension runtimes are omitted. Its `gosu` helper is also rebuilt from
+an immutable upstream revision with a patched Go toolchain and `x/sys`.
+
 ## Start
 
 ```bash
@@ -18,7 +24,7 @@ docker compose --env-file .env up --build
 
 The compose file binds:
 
-- Postgres to `127.0.0.1:5432`
+- Postgres only to the internal Docker network; it has no host-published port
 - `warden-cp` to `${WARDEN_CP_BIND}`, default `127.0.0.1:7878`
 
 Keep that localhost bind unless a TLS reverse proxy, VPN, private subnet, or

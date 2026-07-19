@@ -107,7 +107,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@6026fb2ad3aa556d78b517cf65c8c1f832075860 # v5
 
-      - name: Build production Postgres image
+      - name: Build production application image
         run: docker build -f warden-cp/Dockerfile -t warden-cp:security .
 
       - name: Build hardened PostgreSQL 17 image
@@ -117,6 +117,8 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: warden-cp:security
+          version: v0.72.0
+          hide-progress: "true"
           scanners: vuln,secret
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           ignore-unfixed: "false"
@@ -127,6 +129,8 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: warden-postgres:security
+          version: v0.72.0
+          hide-progress: "true"
           scanners: vuln,secret
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           ignore-unfixed: "false"
