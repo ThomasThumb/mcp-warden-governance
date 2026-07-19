@@ -8,7 +8,7 @@ use ml_dsa::{
     Generate, KeyExport, KeyInit, Keypair, MlDsa65, SignatureEncoding, Signer as MlDsaSigner,
     SigningKey as MlDsaSigningKey, Verifier as MlDsaVerifier, VerifyingKey as MlDsaVerifyingKey,
 };
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
@@ -35,7 +35,7 @@ pub fn mint_spiffe_id(trust_domain: &str, agent_uuid: &str) -> String {
 /// whose authority. `sub` is the agent session's SPIFFE ID; `act.sub` is the
 /// human/service principal that authorized it. Chain further if you ever
 /// have agent-delegates-to-sub-agent scenarios - `act` nests.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
     pub sub: String,     // agent session spiffe_id
     pub act: ActorClaim, // who authorized this agent
@@ -50,12 +50,12 @@ pub struct TokenClaims {
     pub exp: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorClaim {
     pub sub: String, // principal id
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfirmationClaim {
     /// Ed25519 verifying key owned by the worker/agent session. Gateways use
     /// this for a per-call proof-of-possession signature, so stealing the
@@ -220,10 +220,15 @@ impl HybridSigner {
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
     }
 
-    #[allow(dead_code)] // Used by online token introspection and future local admin checks.
     pub fn verify_token(&self, token: &str, require_ml_dsa: bool) -> anyhow::Result<TokenClaims> {
+        if token.len() > 128 * 1024 {
+            anyhow::bail!("token exceeds the accepted size limit");
+        }
         let envelope_bytes = URL_SAFE_NO_PAD.decode(token)?;
         let envelope: SignedEnvelope = serde_json::from_slice(&envelope_bytes)?;
+        if envelope.protected_b64.len() > 16 * 1024 || envelope.payload_b64.len() > 64 * 1024 {
+            anyhow::bail!("token envelope component exceeds the accepted size limit");
+        }
         let header_bytes = URL_SAFE_NO_PAD.decode(&envelope.protected_b64)?;
         let header: ProtectedHeader = serde_json::from_slice(&header_bytes)?;
         if header.typ != TOKEN_TYP || header.alg != TOKEN_ED25519_ALG {
@@ -251,7 +256,7 @@ impl HybridSigner {
         let payload = URL_SAFE_NO_PAD.decode(&envelope.payload_b64)?;
         let claims: TokenClaims = serde_json::from_slice(&payload)?;
         let now = chrono::Utc::now().timestamp();
-        if claims.exp < now {
+        if claims.exp <= now {
             anyhow::bail!("token expired");
         }
         if claims.nbf > now + 60 {
@@ -259,6 +264,12 @@ impl HybridSigner {
         }
         if claims.iat > now + 60 {
             anyhow::bail!("token issued in the future");
+        }
+        if claims.exp <= claims.iat
+            || claims.nbf > claims.exp
+            || claims.exp.saturating_sub(claims.iat) > 3600
+        {
+            anyhow::bail!("token has an invalid validity window");
         }
         Ok(claims)
     }
@@ -403,6 +414,7 @@ impl ExternalSigner {
         let Some(command) = ExternalCommand::from_env(
             "WARDEN_SIGNER_COMMAND",
             "WARDEN_SIGNER_ARGS_JSON",
+            "WARDEN_SIGNER_ENV_FROM_JSON",
             "WARDEN_SIGNER_TIMEOUT_MS",
             5_000,
         )?
@@ -420,7 +432,7 @@ impl ExternalSigner {
             .transpose()?;
         if let Some(key) = &ml_dsa65_public_key {
             MlDsaVerifyingKey::<MlDsa65>::new_from_slice(key)?;
-        } else if !truthy_env("WARDEN_SIGNER_ALLOW_ED25519_ONLY") {
+        } else if !bool_env("WARDEN_SIGNER_ALLOW_ED25519_ONLY")? {
             anyhow::bail!(
                 "WARDEN_SIGNER_COMMAND requires WARDEN_SIGNER_ML_DSA65_PUBLIC_KEY_B64; \
                  set WARDEN_SIGNER_ALLOW_ED25519_ONLY=true only for a documented migration"
@@ -553,10 +565,16 @@ fn decode_public_key_value(name: &str, value: &str) -> anyhow::Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("{name} must be URL-safe base64 without padding: {e}"))
 }
 
-fn truthy_env(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+fn bool_env(name: &str) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(true),
+            "0" | "false" | "no" => Ok(false),
+            _ => anyhow::bail!("{name} must be one of true, false, 1, 0, yes, or no"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn load_or_generate_ml_dsa(path: &Path) -> anyhow::Result<MlDsaSigningKey<MlDsa65>> {

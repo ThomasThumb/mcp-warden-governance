@@ -55,7 +55,14 @@ impl AuditAnchor {
         self.file_path.is_some() || self.command.is_some()
     }
 
-    pub fn publish(&self, record: &AuditAnchorRecord) -> anyhow::Result<()> {
+    pub async fn publish(&self, record: AuditAnchorRecord) -> anyhow::Result<()> {
+        let anchor = self.clone();
+        tokio::task::spawn_blocking(move || anchor.publish_blocking(&record))
+            .await
+            .map_err(|e| anyhow::anyhow!("audit anchor worker failed: {e}"))?
+    }
+
+    fn publish_blocking(&self, record: &AuditAnchorRecord) -> anyhow::Result<()> {
         if let Some(path) = &self.file_path {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -71,7 +78,14 @@ impl AuditAnchor {
         Ok(())
     }
 
-    pub fn latest(&self) -> anyhow::Result<Option<AuditAnchorRecord>> {
+    pub async fn latest(&self) -> anyhow::Result<Option<AuditAnchorRecord>> {
+        let anchor = self.clone();
+        tokio::task::spawn_blocking(move || anchor.latest_blocking())
+            .await
+            .map_err(|e| anyhow::anyhow!("audit anchor worker failed: {e}"))?
+    }
+
+    fn latest_blocking(&self) -> anyhow::Result<Option<AuditAnchorRecord>> {
         if let Some(command) = &self.command {
             return command.latest();
         }
@@ -115,6 +129,7 @@ impl AnchorCommand {
         let command = crate::external_command::ExternalCommand::from_env(
             "AUDIT_ANCHOR_COMMAND",
             "AUDIT_ANCHOR_ARGS_JSON",
+            "AUDIT_ANCHOR_ENV_FROM_JSON",
             "AUDIT_ANCHOR_TIMEOUT_MS",
             5_000,
         )?;

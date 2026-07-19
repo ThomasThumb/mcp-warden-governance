@@ -28,6 +28,7 @@ pub struct ListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimUserIn {
     #[serde(rename = "userName")]
     pub user_name: String,
@@ -40,12 +41,14 @@ pub struct ScimUserIn {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimEmail {
     pub value: String,
     pub primary: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScimGroupIn {
     #[serde(rename = "displayName")]
     pub display_name: String,
@@ -62,12 +65,14 @@ pub struct ScimMember {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchRequest {
     #[serde(rename = "Operations")]
     pub operations: Vec<PatchOperation>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchOperation {
     pub op: String,
     pub path: Option<String>,
@@ -110,29 +115,36 @@ pub async fn list_users(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
     ensure_scim_admin(&state, &principal).await?;
-    let (where_sql, bind_value) = filter_clause(query.filter.as_deref(), "userName");
+    let bind_value = equality_filter(query.filter.as_deref(), "userName")?;
     let limit = query.count.unwrap_or(100).clamp(1, 200);
     let offset = query.start_index.unwrap_or(1).max(1) - 1;
-    let (limit_param, offset_param) = if bind_value.is_some() {
-        ("$2", "$3")
-    } else {
-        ("$1", "$2")
-    };
-    let sql = format!(
-        "SELECT id, display_name, external_id, active, created_at FROM principals
-         WHERE kind = 'human' {where_sql}
-         ORDER BY display_name LIMIT {limit_param} OFFSET {offset_param}"
-    );
-    let mut q = sqlx::query(&sql);
-    if let Some(value) = bind_value {
-        q = q.bind(value);
-    }
-    let rows = q
+    let rows = if let Some(value) = bind_value {
+        sqlx::query(
+            "SELECT id, display_name, external_id, active, created_at FROM principals
+             WHERE kind = 'human'
+               AND id IN (
+                   SELECT principal_id FROM principal_identities
+                   WHERE provider = 'scim' AND external_subject = $1
+               )
+             ORDER BY display_name LIMIT $2 OFFSET $3",
+        )
+        .bind(value)
         .bind(limit)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
-        .map_err(err500)?;
+    } else {
+        sqlx::query(
+            "SELECT id, display_name, external_id, active, created_at FROM principals
+             WHERE kind = 'human'
+             ORDER BY display_name LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+    }
+    .map_err(err500)?;
     let mut resources = Vec::with_capacity(rows.len());
     for row in rows {
         resources.push(user_json(&state, &row).await?);
@@ -185,7 +197,13 @@ pub async fn patch_user(
 ) -> ApiResult<Json<Value>> {
     ensure_scim_admin(&state, &principal).await?;
     ensure_principal(&state, &id).await?;
+    if req.operations.len() > 100 {
+        return Err(bad_request("SCIM patch may contain at most 100 operations"));
+    }
     for op in req.operations {
+        if !matches!(op.op.to_ascii_lowercase().as_str(), "add" | "replace") {
+            return Err(bad_request("unsupported SCIM user patch operation"));
+        }
         let path = op.path.unwrap_or_default().to_ascii_lowercase();
         if path == "active" {
             if op.value == Some(Value::Bool(false)) {
@@ -199,13 +217,20 @@ pub async fn patch_user(
             }
         } else if path == "displayname" || path == "username" {
             if let Some(Value::String(value)) = op.value {
+                validate_scim_text("SCIM display name", &value, 256)?;
                 sqlx::query("UPDATE principals SET display_name = $1 WHERE id = $2")
                     .bind(value)
                     .bind(&id)
                     .execute(&state.pool)
                     .await
                     .map_err(err500)?;
+            } else {
+                return Err(bad_request(
+                    "SCIM display name patch requires a string value",
+                ));
             }
+        } else {
+            return Err(bad_request("unsupported SCIM user patch path"));
         }
     }
     let row = principal_row(&state, &id).await?;
@@ -229,29 +254,32 @@ pub async fn list_groups(
     Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
     ensure_scim_admin(&state, &principal).await?;
-    let (where_sql, bind_value) = filter_clause(query.filter.as_deref(), "displayName");
+    let bind_value = equality_filter(query.filter.as_deref(), "displayName")?;
     let limit = query.count.unwrap_or(100).clamp(1, 200);
     let offset = query.start_index.unwrap_or(1).max(1) - 1;
-    let (limit_param, offset_param) = if bind_value.is_some() {
-        ("$2", "$3")
-    } else {
-        ("$1", "$2")
-    };
-    let sql = format!(
-        "SELECT id, display_name, external_id, active, created_at FROM groups
-         WHERE active = 1 {where_sql}
-         ORDER BY display_name LIMIT {limit_param} OFFSET {offset_param}"
-    );
-    let mut q = sqlx::query(&sql);
-    if let Some(value) = bind_value {
-        q = q.bind(value);
-    }
-    let rows = q
+    let rows = if let Some(value) = bind_value {
+        sqlx::query(
+            "SELECT id, display_name, external_id, active, created_at FROM groups
+             WHERE active = 1 AND display_name = $1
+             ORDER BY display_name LIMIT $2 OFFSET $3",
+        )
+        .bind(value)
         .bind(limit)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
-        .map_err(err500)?;
+    } else {
+        sqlx::query(
+            "SELECT id, display_name, external_id, active, created_at FROM groups
+             WHERE active = 1
+             ORDER BY display_name LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+    }
+    .map_err(err500)?;
     let mut resources = Vec::with_capacity(rows.len());
     for row in rows {
         resources.push(group_json(&state, &row).await?);
@@ -302,20 +330,33 @@ pub async fn patch_group(
 ) -> ApiResult<Json<Value>> {
     ensure_scim_admin(&state, &principal).await?;
     ensure_group(&state, &id).await?;
+    if req.operations.len() > 100 {
+        return Err(bad_request("SCIM patch may contain at most 100 operations"));
+    }
     for op in req.operations {
         let op_name = op.op.to_ascii_lowercase();
+        if !matches!(op_name.as_str(), "add" | "replace" | "remove") {
+            return Err(bad_request("unsupported SCIM group patch operation"));
+        }
         let path = op.path.unwrap_or_default().to_ascii_lowercase();
         if path == "members" || path.is_empty() {
             apply_member_patch(&state, &id, &op_name, op.value).await?;
         } else if path == "displayname" {
             if let Some(Value::String(value)) = op.value {
+                validate_scim_text("SCIM group display name", &value, 256)?;
                 sqlx::query("UPDATE groups SET display_name = $1 WHERE id = $2")
                     .bind(value)
                     .bind(&id)
                     .execute(&state.pool)
                     .await
                     .map_err(err500)?;
+            } else {
+                return Err(bad_request(
+                    "SCIM group display name patch requires a string value",
+                ));
             }
+        } else {
+            return Err(bad_request("unsupported SCIM group patch path"));
         }
     }
     let row = group_row(&state, &id).await?;
@@ -367,6 +408,7 @@ async fn ensure_scim_admin(state: &AppState, principal: &AuthedPrincipal) -> Api
 }
 
 async fn upsert_user(state: &AppState, req: ScimUserIn) -> ApiResult<String> {
+    validate_scim_user(&req)?;
     let subject = req
         .external_id
         .clone()
@@ -426,6 +468,7 @@ async fn upsert_user(state: &AppState, req: ScimUserIn) -> ApiResult<String> {
 }
 
 async fn update_user(state: &AppState, id: &str, req: &ScimUserIn) -> ApiResult<()> {
+    validate_scim_user(req)?;
     let display = req
         .display_name
         .clone()
@@ -451,6 +494,7 @@ async fn update_user(state: &AppState, id: &str, req: &ScimUserIn) -> ApiResult<
 }
 
 async fn upsert_group(state: &AppState, req: ScimGroupIn) -> ApiResult<String> {
+    validate_scim_group(&req)?;
     let external = req
         .external_id
         .clone()
@@ -484,6 +528,7 @@ async fn upsert_group(state: &AppState, req: ScimGroupIn) -> ApiResult<String> {
 }
 
 async fn update_group(state: &AppState, id: &str, req: &ScimGroupIn) -> ApiResult<()> {
+    validate_scim_group(req)?;
     sqlx::query("UPDATE groups SET display_name = $1, active = 1 WHERE id = $2")
         .bind(&req.display_name)
         .bind(id)
@@ -520,6 +565,14 @@ async fn apply_member_patch(
     value: Option<Value>,
 ) -> ApiResult<()> {
     let members = parse_members(value)?;
+    if members.len() > 500 {
+        return Err(bad_request(
+            "a SCIM group patch may contain at most 500 members",
+        ));
+    }
+    for member in &members {
+        validate_scim_text("SCIM member id", &member.value, 128)?;
+    }
     match op {
         "add" | "replace" => {
             if op == "replace" {
@@ -653,16 +706,20 @@ async fn user_json(state: &AppState, row: &DbRow) -> ApiResult<Value> {
     .map_err(err500)?;
     let user_name = identities
         .as_ref()
-        .and_then(|r| r.try_get::<String, _>("external_subject").ok())
+        .map(|r| r.try_get::<String, _>("external_subject").map_err(err500))
+        .transpose()?
         .unwrap_or_else(|| id.clone());
-    let email = identities.and_then(|r| r.try_get::<String, _>("email").ok());
+    let email = identities
+        .map(|r| r.try_get::<Option<String>, _>("email").map_err(err500))
+        .transpose()?
+        .flatten();
     Ok(json!({
         "schemas": [USER_SCHEMA],
         "id": id,
         "userName": user_name,
         "displayName": row.try_get::<String, _>("display_name").map_err(err500)?,
-        "externalId": row.try_get::<Option<String>, _>("external_id").ok().flatten(),
-        "active": row.try_get::<i64, _>("active").unwrap_or(1) != 0,
+        "externalId": row.try_get::<Option<String>, _>("external_id").map_err(err500)?,
+        "active": row.try_get::<i64, _>("active").map_err(err500)? != 0,
         "emails": email.map(|value| vec![json!({"value": value, "primary": true})]).unwrap_or_default(),
         "meta": { "resourceType": "User", "created": row.try_get::<String, _>("created_at").map_err(err500)? }
     }))
@@ -692,7 +749,7 @@ async fn group_json(state: &AppState, row: &DbRow) -> ApiResult<Value> {
         "schemas": [GROUP_SCHEMA],
         "id": id,
         "displayName": row.try_get::<String, _>("display_name").map_err(err500)?,
-        "externalId": row.try_get::<Option<String>, _>("external_id").ok().flatten(),
+        "externalId": row.try_get::<Option<String>, _>("external_id").map_err(err500)?,
         "members": members,
         "meta": { "resourceType": "Group", "created": row.try_get::<String, _>("created_at").map_err(err500)? }
     }))
@@ -708,20 +765,32 @@ fn list_response(resources: Vec<Value>, start_index: i64, count: i64) -> Value {
     })
 }
 
-fn filter_clause(filter: Option<&str>, field: &str) -> (String, Option<String>) {
+fn equality_filter(filter: Option<&str>, field: &str) -> ApiResult<Option<String>> {
     let Some(filter) = filter else {
-        return ("".into(), None);
+        return Ok(None);
     };
     let prefix = format!("{field} eq ");
     if !filter.starts_with(&prefix) {
-        return ("".into(), None);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("only the SCIM filter '{field} eq \"value\"' is supported"),
+        ));
     }
-    let value = filter[prefix.len()..].trim().trim_matches('"').to_string();
-    if field == "userName" {
-        ("AND id IN (SELECT principal_id FROM principal_identities WHERE provider = 'scim' AND external_subject = $1)".into(), Some(value))
-    } else {
-        ("AND display_name = $1".into(), Some(value))
+    let quoted = filter[prefix.len()..].trim();
+    if quoted.len() < 2 || !quoted.starts_with('"') || !quoted.ends_with('"') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SCIM equality filter values must be quoted".into(),
+        ));
     }
+    let value = &quoted[1..quoted.len() - 1];
+    if value.is_empty() || value.len() > 512 || value.contains('"') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SCIM equality filter value is invalid".into(),
+        ));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn primary_email(req: &ScimUserIn) -> Option<String> {
@@ -734,8 +803,64 @@ fn primary_email(req: &ScimUserIn) -> Option<String> {
     })
 }
 
+fn validate_scim_text(label: &str, value: &str, max_len: usize) -> ApiResult<()> {
+    if value.trim().is_empty()
+        || value.len() > max_len
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(bad_request(format!(
+            "{label} must be 1-{max_len} non-control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_scim_user(req: &ScimUserIn) -> ApiResult<()> {
+    validate_scim_text("SCIM userName", &req.user_name, 256)?;
+    if let Some(display_name) = &req.display_name {
+        validate_scim_text("SCIM displayName", display_name, 256)?;
+    }
+    if let Some(external_id) = &req.external_id {
+        validate_scim_text("SCIM externalId", external_id, 512)?;
+    }
+    if req.emails.as_ref().is_some_and(|emails| emails.len() > 16) {
+        return Err(bad_request("a SCIM user may have at most 16 email entries"));
+    }
+    for email in req.emails.iter().flatten() {
+        validate_scim_text("SCIM email", &email.value, 320)?;
+        if !email.value.contains('@') {
+            return Err(bad_request("SCIM email must contain '@'"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scim_group(req: &ScimGroupIn) -> ApiResult<()> {
+    validate_scim_text("SCIM group displayName", &req.display_name, 256)?;
+    if let Some(external_id) = &req.external_id {
+        validate_scim_text("SCIM externalId", external_id, 512)?;
+    }
+    if req
+        .members
+        .as_ref()
+        .is_some_and(|members| members.len() > 500)
+    {
+        return Err(bad_request(
+            "a SCIM group may have at most 500 members per request",
+        ));
+    }
+    for member in req.members.iter().flatten() {
+        validate_scim_text("SCIM member id", &member.value, 128)?;
+    }
+    Ok(())
+}
+
 fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "internal SCIM operation failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+    )
 }
 
 fn bad_request(e: impl std::fmt::Display) -> (StatusCode, String) {

@@ -15,6 +15,8 @@ const TOKEN_CONTEXT: &str = "warden-cp/token/v2";
 const TOKEN_TYP: &str = "warden-cp.token.v2";
 const TOKEN_ED25519_ALG: &str = "Ed25519";
 const TOKEN_ML_DSA_ALG: &str = "ML-DSA-65";
+const MAX_TOKEN_BYTES: usize = 128 * 1024;
+const MAX_TOKEN_LIFETIME_SECONDS: i64 = 3600;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TokenClaims {
@@ -65,6 +67,9 @@ pub fn verify_token(
     expected_audience: &str,
     token: &str,
 ) -> anyhow::Result<TokenClaims> {
+    if token.len() > MAX_TOKEN_BYTES {
+        anyhow::bail!("token exceeds the accepted size limit");
+    }
     let decoded_key = URL_SAFE_NO_PAD.decode(verifying_key_b64)?;
     let expected_kid = key_id(&decoded_key);
     let key_bytes: [u8; 32] = decoded_key
@@ -74,6 +79,9 @@ pub fn verify_token(
 
     let envelope_bytes = URL_SAFE_NO_PAD.decode(token)?;
     let envelope: SignedEnvelope = serde_json::from_slice(&envelope_bytes)?;
+    if envelope.protected_b64.len() > 16 * 1024 || envelope.payload_b64.len() > 64 * 1024 {
+        anyhow::bail!("token envelope component exceeds the accepted size limit");
+    }
     let header_bytes = URL_SAFE_NO_PAD.decode(&envelope.protected_b64)?;
     let header: ProtectedHeader = serde_json::from_slice(&header_bytes)?;
     if header.typ != TOKEN_TYP || header.alg != TOKEN_ED25519_ALG {
@@ -96,7 +104,7 @@ pub fn verify_token(
     let payload = URL_SAFE_NO_PAD.decode(&envelope.payload_b64)?;
     let claims: TokenClaims = serde_json::from_slice(&payload)?;
     let now = chrono::Utc::now().timestamp();
-    if claims.exp < now {
+    if claims.exp <= now {
         anyhow::bail!("token expired");
     }
     if claims.nbf > now + 60 {
@@ -104,6 +112,25 @@ pub fn verify_token(
     }
     if claims.iat > now + 60 {
         anyhow::bail!("token issued in the future");
+    }
+    if claims.exp <= claims.iat
+        || claims.nbf > claims.exp
+        || claims.exp.saturating_sub(claims.iat) > MAX_TOKEN_LIFETIME_SECONDS
+    {
+        anyhow::bail!("token has an invalid validity window");
+    }
+    if [
+        claims.sub.as_str(),
+        claims.act.sub.as_str(),
+        claims.aud.as_str(),
+        claims.server_id.as_str(),
+        claims.tool_name.as_str(),
+        claims.gateway_id.as_str(),
+    ]
+    .iter()
+    .any(|value| value.is_empty() || value.len() > 512)
+    {
+        anyhow::bail!("token contains an invalid scoped identifier");
     }
     if claims.aud != expected_audience {
         anyhow::bail!("token audience does not match this gateway/server/tool call");
@@ -138,7 +165,12 @@ fn verify_ml_dsa_signature(
 }
 
 pub fn token_audience(gateway_id: &str, server_id: &str, tool_name: &str) -> String {
-    format!("warden-mcp:{gateway_id}:{server_id}:{tool_name}")
+    format!(
+        "warden-mcp:v2:{}:{gateway_id}:{}:{server_id}:{}:{tool_name}",
+        gateway_id.len(),
+        server_id.len(),
+        tool_name.len()
+    )
 }
 
 fn token_signing_input(protected_b64: &str, payload_b64: &str) -> Vec<u8> {
@@ -215,11 +247,12 @@ mod tests {
     fn hybrid_token_requires_ml_dsa_when_enabled() {
         let ed = SigningKey::from_bytes(&[9u8; 32]);
         let ml = MlDsaSigningKey::<MlDsa65>::generate();
+        let audience = token_audience("gw-1", "docs", "search");
         let claims = serde_json::json!({
             "sub": "spiffe://warden.local/agent/550e8400-e29b-41d4-a716-446655440000",
             "act": { "sub": "principal-1" },
             "cnf": { "ed25519_public_key_b64": BASE64_STANDARD.encode([7u8; 32]) },
-            "aud": "warden-mcp:gw-1:docs:search",
+            "aud": audience,
             "server_id": "docs",
             "tool_name": "search",
             "gateway_id": "gw-1",
@@ -255,18 +288,33 @@ mod tests {
             &ed_key,
             Some(&ml_key),
             true,
-            "warden-mcp:gw-1:docs:search",
+            &token_audience("gw-1", "docs", "search"),
             &token,
         )
         .unwrap();
-        assert!(verify_token(&ed_key, None, true, "warden-mcp:gw-1:docs:search", &token).is_err());
+        assert!(verify_token(
+            &ed_key,
+            None,
+            true,
+            &token_audience("gw-1", "docs", "search"),
+            &token
+        )
+        .is_err());
         assert!(verify_token(
             &ed_key,
             Some(&ml_key),
             true,
-            "warden-mcp:gw-1:docs:other",
+            &token_audience("gw-1", "docs", "other"),
             &token
         )
         .is_err());
+    }
+
+    #[test]
+    fn token_audience_is_tuple_unambiguous() {
+        assert_ne!(
+            token_audience("gateway", "server:a", "tool"),
+            token_audience("gateway", "server", "a:tool")
+        );
     }
 }

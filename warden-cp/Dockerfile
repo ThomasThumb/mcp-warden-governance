@@ -1,15 +1,40 @@
-FROM rust:1-bookworm AS build
+# Build from the REPO ROOT (workspace context), not warden-cp/:
+#   docker build -f warden-cp/Dockerfile -t warden-cp .
+#
+# Base images are digest-pinned so the signed release image is built by a
+# known compiler and runs on a known minimal userspace.
+# Dependabot's docker ecosystem keeps the digests fresh.
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
 WORKDIR /src
-COPY . .
-RUN cargo build --release --no-default-features --features postgres
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --home /var/lib/warden-cp --create-home --shell /usr/sbin/nologin warden-cp
+# Dependency layer: manifests + lockfile only, so editing source doesn't
+# recompile ~300 dependencies. Both member manifests must be present for
+# cargo to parse the workspace.
+COPY Cargo.toml Cargo.lock ./
+COPY warden-cp/Cargo.toml warden-cp/Cargo.toml
+COPY mcp-warden/mcp-warden/Cargo.toml mcp-warden/mcp-warden/Cargo.toml
+RUN mkdir -p warden-cp/src mcp-warden/mcp-warden/src \
+    && echo 'fn main() {}' > warden-cp/src/main.rs \
+    && echo 'fn main() {}' > mcp-warden/mcp-warden/src/main.rs \
+    && cargo build --release --locked -p warden-cp --no-default-features --features postgres \
+    && rm -rf warden-cp/src mcp-warden/mcp-warden/src
+
+COPY warden-cp warden-cp
+COPY mcp-warden mcp-warden
+# touch so cargo notices the real sources are newer than the stub build
+RUN touch warden-cp/src/main.rs \
+    && cargo build --release --locked -p warden-cp --no-default-features --features postgres
+
+# Distroless provides only the dynamic C runtime, CA roots, and timezone data
+# needed by the Rust binary: no package manager, shell, Perl, or login tools.
+# The nonroot image's stable numeric identity is 65532:65532.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa
+COPY --chown=65532:65532 LICENSE /var/lib/warden-cp/LICENSE
 WORKDIR /var/lib/warden-cp
-COPY --from=build /src/target/release/warden-cp /usr/local/bin/warden-cp
-USER warden-cp
+COPY --from=build --chown=65532:65532 /src/target/release/warden-cp /usr/local/bin/warden-cp
+USER 65532:65532
 EXPOSE 7878
+# No HEALTHCHECK on purpose: the service intentionally exposes no
+# unauthenticated endpoint (see main.rs). If a /healthz is added later on a
+# separate unauthenticated router, add the HEALTHCHECK alongside it.
 ENTRYPOINT ["warden-cp"]

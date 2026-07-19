@@ -5,7 +5,7 @@ etc.) and every real MCP server you connect to. The host talks only to
 `mcp-warden`; `mcp-warden` talks to your actual servers and decides what the
 host is allowed to see and do.
 
-## Status: this is a working v0.1 skeleton, not a finished product
+## Status: working pre-1.0 release
 
 What's real and implemented:
 - Aggregates tools from multiple stdio-spawned upstream servers into one
@@ -39,8 +39,7 @@ What's real and implemented:
   wrapper modes are available for stdio servers; missing wrappers fail closed
   at startup instead of silently running unsandboxed.
 
-What's explicitly NOT done yet (see "Roadmap" below), on purpose rather than
-by accident:
+Remaining product work (see "Roadmap" below):
 - **A polished approval UX.** The control-plane approval API is real; a thin
   dashboard, Slack app, or CLI watcher is still the next usability layer.
 - **Native SPIRE/SVID issuance.** Agent session IDs are already SPIFFE-shaped,
@@ -65,53 +64,22 @@ can dodge regex, a hash pin only catches *changes*, not day-one malice. The
 point of stacking them is that an attacker has to beat all of them
 simultaneously, not just the weakest one.
 
-## A note on how this was built
-
-I (the AI that wrote this) verified the `rmcp` crate's existence, its
-`ServerHandler`/`ClientHandler` trait shapes, and its transport APIs against
-the SDK's actual published source and docs rather than from memory - but I
-could not compile this end-to-end in my own sandbox, which only has an old
-system Rust (1.75) with no path to a newer toolchain. The current `rmcp`
-targets edition 2024, which needs rustc 1.85+.
-
-**First thing to do on your machine:** run `cargo check`. It will very likely
-need a couple of small fixes - rmcp has shipped breaking changes across
-versions before, and I can't guarantee byte-perfect signatures for whatever
-version resolves for you. Places most likely to need a tweak, in rough order
-of risk:
-
-1. `gateway.rs` - the exact `ErrorData`/`McpError` constructor name (I used
-   `McpError::invalid_params(msg, None)` as a placeholder; centralized in one
-   `deny()` helper so it's a one-line fix if wrong)
-2. `gateway.rs` - `ServerCapabilities::builder().enable_tools()` - confirm
-   this method name via `cargo doc -p rmcp --open`
-3. `warden.example.toml` - the `[servers.env]` sub-table under an internally
-   tagged, flattened enum variant is a spot where `toml`/`serde` interactions
-   occasionally need a rewrite to an inline table (`env = { KEY = "val" }`)
-4. `upstream.rs` / `gateway.rs` - `PaginatedRequestParam` naming
-   (singular/plural has drifted between rmcp releases in different docs I
-   checked)
-
-`rego_policy.rs` is much safer ground than the `rmcp` integration - Rego and
-`regorus` change far less often, and any signature drift there degrades to
-"policy always requires approval," never to "policy always allows," per its
-own fail-safe design. `policy.rs` also now has real unit tests
-(`cargo test`) covering the one invariant the whole design depends on -
-run them before you trust any change to that file, including mine.
-
-None of these are logic bugs - they're all "the SDK renamed something,"
-which `cargo check`'s error messages will point at directly.
+The workspace is locked to a tested Rust and dependency set. Security denials
+use stable MCP error categories plus a machine-readable `data.warden.code`;
+internal upstream, token, and policy details are logged server-side rather than
+returned to an untrusted MCP client. Rego compilation or evaluation failures
+fail closed to `RequireApproval`.
 
 ## Setup
 
 ```bash
-# You need Rust 1.85+ (edition 2024). If `rustc --version` shows older:
+# The workspace pins Rust 1.95 in rust-toolchain.toml. If rustup is missing:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update stable
 
 cp warden.example.toml warden.toml
 # edit warden.toml: point at your real servers, set env vars for tokens
-cargo check         # fix whatever it flags per the table above
+cargo check --workspace --locked
 cargo build --release
 ```
 
@@ -164,7 +132,9 @@ If `[control_plane]` is set in `warden.toml`, this gateway now:
 url = "https://localhost:7878"
 gateway_id = "laptop-jane"
 owner_principal_id = "principal-uuid-here"
-max_degraded_minutes = 60   # just documents the default you'd pass to confirm-degraded
+# The API key is read at startup and is never accepted as a TOML literal.
+api_key_env = "MCP_WARDEN_CP_API_KEY"
+max_degraded_minutes = 60
 signer_public_key_b64 = "optional-if-control-plane-is-reachable-at-startup"
 ml_dsa_public_key_b64 = "optional-if-control-plane-is-reachable-at-startup"
 require_ml_dsa_token_signature = true
@@ -192,6 +162,10 @@ of replaying the same `(token, proof, args)` tuple.
 ./mcp-warden confirm-degraded --reason "VPN down, on-call needs this working" --minutes 60
 ./mcp-warden serve warden.toml   # now runs, loudly logged as DEGRADED, expires on its own
 ```
+
+During the acknowledged degraded window, the gateway still verifies the
+hybrid token envelope and proof locally and consumes each token ID once in
+memory. It does not bypass authentication, policy, or replay protection.
 
 This is deliberately not automatic in either direction - no silent fail-open
 (which would mean "control plane down" quietly becomes "no governance at
@@ -311,7 +285,10 @@ workspace = "/srv/agent-workspaces/filesystem"
 allow_network = false
 ```
 
-Docker mode also needs `docker_image`. These wrappers are intentionally
+Docker mode also needs an immutable digest-pinned image, for example
+`docker_image = "registry.example/worker@sha256:<64-hex-digest>"`. Wrapper
+arguments are fixed by the gateway so configuration cannot override network,
+read-only-root, or namespace isolation. These wrappers are intentionally
 opt-in because they depend on host tooling and OS support. A missing wrapper
 binary fails closed at startup instead of silently running unsandboxed.
 
@@ -384,9 +361,9 @@ nullclaw contributors. See `THIRD_PARTY_NOTICES.md`.
 3. **Sandbox profile hardening** - turn the current host-tool wrappers into
    reviewed per-upstream profiles and add Landlock where Linux deployments can
    use it.
-4. **Anomaly detection** - rate limiting per tool/server, alerting on
-   dormant-tool reactivation and oversized responses (possible exfil), along
-   the lines of the SIEM-style rules described in the audit log.
+4. **Deeper anomaly detection** - add per-tool/server behavioral baselines and
+   dormant-tool reactivation alerts on top of the existing response-size
+   limits and control-plane anomaly feed.
 5. **Swap the heuristic injection filter for a second-tier semantic check**
    on anything the regex layer doesn't confidently clear - keep in mind this
    adds latency and its own attack surface (a filter model can itself be

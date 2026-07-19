@@ -15,7 +15,7 @@ pub enum Decision {
 /// produce, Blocked or Deny. That boundary is enforced by the match
 /// statement below, not by convention: `floor_decision`'s Deny/Allow arms
 /// return immediately without `rego` ever being touched.
-pub fn evaluate(
+pub async fn evaluate(
     server: &UpstreamConfig,
     tool_name: &str,
     rego: Option<&RegoPolicy>,
@@ -26,7 +26,7 @@ pub fn evaluate(
         Decision::Allow => Decision::Allow,
         Decision::RequireApproval => {
             if let (Some(rego), Some(input)) = (rego, input) {
-                if rego.evaluate(input) {
+                if rego.evaluate(input).await {
                     return Decision::Allow;
                 }
             }
@@ -73,6 +73,7 @@ mod tests {
                 command: "true".into(),
                 args: vec![],
                 env: HashMap::new(),
+                env_from: HashMap::new(),
                 sandbox: None,
             },
             default_risk,
@@ -99,8 +100,8 @@ mod tests {
     /// THE core safety invariant this whole design rests on: no matter what
     /// a custom Rego policy says, a Blocked tool stays blocked. This test
     /// existing and passing is not optional.
-    #[test]
-    fn blocked_tools_ignore_rego_entirely() {
+    #[tokio::test]
+    async fn blocked_tools_ignore_rego_entirely() {
         let mut tools = HashMap::new();
         tools.insert(
             "delete_everything".to_string(),
@@ -113,35 +114,35 @@ mod tests {
         let rego = always_auto_approve_rego();
         let input = dummy_input();
 
-        let decision = evaluate(&server, "delete_everything", Some(&rego), Some(&input));
+        let decision = evaluate(&server, "delete_everything", Some(&rego), Some(&input)).await;
         assert!(matches!(decision, Decision::Deny(_)));
     }
 
-    #[test]
-    fn rego_can_upgrade_require_approval_to_allow() {
+    #[tokio::test]
+    async fn rego_can_upgrade_require_approval_to_allow() {
         let server = server_with(RiskTier::RequireApproval, HashMap::new());
         let rego = always_auto_approve_rego();
         let input = dummy_input();
 
-        let decision = evaluate(&server, "read_docs", Some(&rego), Some(&input));
+        let decision = evaluate(&server, "read_docs", Some(&rego), Some(&input)).await;
         assert!(matches!(decision, Decision::Allow));
     }
 
-    #[test]
-    fn rego_eval_error_fails_safe_to_require_approval_not_allow() {
+    #[tokio::test]
+    async fn rego_eval_error_fails_safe_to_require_approval_not_allow() {
         // A policy that compiles but never defines auto_approve at all.
         let broken = RegoPolicy::compile("package warden\nimport rego.v1\nx := 1").unwrap();
         let server = server_with(RiskTier::RequireApproval, HashMap::new());
         let input = dummy_input();
 
-        let decision = evaluate(&server, "read_docs", Some(&broken), Some(&input));
+        let decision = evaluate(&server, "read_docs", Some(&broken), Some(&input)).await;
         assert!(matches!(decision, Decision::RequireApproval));
     }
 
-    #[test]
-    fn no_rego_configured_keeps_default_behavior() {
+    #[tokio::test]
+    async fn no_rego_configured_keeps_default_behavior() {
         let server = server_with(RiskTier::RequireApproval, HashMap::new());
-        let decision = evaluate(&server, "read_docs", None, None);
+        let decision = evaluate(&server, "read_docs", None, None).await;
         assert!(matches!(decision, Decision::RequireApproval));
     }
 }

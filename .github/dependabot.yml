@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Single workspace lockfile at the repo root covers both crates.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Batch semver-compatible bumps into one PR to keep noise down;
+      # security updates still arrive individually and immediately.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /warden-cp
+    schedule:
+      interval: weekly

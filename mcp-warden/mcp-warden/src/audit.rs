@@ -35,6 +35,7 @@ impl AuditLog {
             .append(true)
             .open(&self.path)?;
         writeln!(f, "{}", serde_json::to_string(event)?)?;
+        f.sync_data()?;
         Ok(())
     }
 
@@ -42,10 +43,10 @@ impl AuditLog {
         Utc::now().to_rfc3339()
     }
 
-    pub fn fingerprint_args(args: &serde_json::Value) -> String {
+    pub fn fingerprint_args(args: &serde_json::Value) -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(serde_json::to_vec(args).unwrap_or_default());
-        format!("{:x}", hasher.finalize())
+        hasher.update(serde_json::to_vec(args)?);
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }

@@ -10,6 +10,7 @@ mod routes;
 mod scim;
 mod transport;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, post, put};
 use axum::Router;
@@ -21,32 +22,24 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-async fn load_chain_tail(pool: &db::DbPool) -> AuditChainTail {
+async fn load_chain_tail(pool: &db::DbPool) -> anyhow::Result<AuditChainTail> {
     let row = sqlx::query(
         "SELECT seq, entry_hash FROM audit_events
          ORDER BY CASE WHEN seq IS NULL THEN 0 ELSE 1 END DESC, seq DESC, ts DESC
          LIMIT 1",
     )
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    match row {
+    .await?;
+    Ok(match row {
         Some(r) => AuditChainTail {
-            seq: r
-                .try_get::<Option<i64>, _>("seq")
-                .ok()
-                .flatten()
-                .unwrap_or(0),
-            hash: r
-                .try_get::<String, _>("entry_hash")
-                .unwrap_or_else(|_| GENESIS_HASH.to_string()),
+            seq: r.try_get::<Option<i64>, _>("seq")?.unwrap_or(0),
+            hash: r.try_get("entry_hash")?,
         },
         None => AuditChainTail {
             seq: 0,
             hash: GENESIS_HASH.to_string(),
         },
-    }
+    })
 }
 
 fn enforce_transport_security(bind_addr: &str, security: &TransportSecurity) -> anyhow::Result<()> {
@@ -63,7 +56,7 @@ fn enforce_transport_security(bind_addr: &str, security: &TransportSecurity) -> 
              WARDEN_CP_TRUST_PROXY_HEADERS=true while binding warden-cp to loopback"
         );
     }
-    if is_loopback_bind(bind_addr) || truthy_env("WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK") {
+    if is_loopback_bind(bind_addr) || bool_env("WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK")? {
         return Ok(());
     }
     anyhow::bail!(
@@ -82,26 +75,40 @@ fn is_loopback_bind(bind_addr: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
-fn truthy_env(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn audit_ml_dsa_checkpoint_interval() -> i64 {
-    std::env::var("AUDIT_ML_DSA_CHECKPOINT_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|value| value.max(1))
-        .unwrap_or(1)
-}
-
-fn transport_security_from_env(tls_enabled: bool) -> TransportSecurity {
-    TransportSecurity {
-        tls_enabled,
-        require_https: truthy_env("WARDEN_CP_REQUIRE_HTTPS"),
-        trust_proxy_headers: truthy_env("WARDEN_CP_TRUST_PROXY_HEADERS"),
+fn bool_env(name: &str) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(true),
+            "0" | "false" | "no" => Ok(false),
+            _ => anyhow::bail!("{name} must be one of true, false, 1, 0, yes, or no"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
     }
+}
+
+fn audit_ml_dsa_checkpoint_interval() -> anyhow::Result<i64> {
+    match std::env::var("AUDIT_ML_DSA_CHECKPOINT_INTERVAL") {
+        Ok(value) => {
+            let interval = value.parse::<i64>().map_err(|_| {
+                anyhow::anyhow!("AUDIT_ML_DSA_CHECKPOINT_INTERVAL must be an integer")
+            })?;
+            if !(1..=1_000_000).contains(&interval) {
+                anyhow::bail!("AUDIT_ML_DSA_CHECKPOINT_INTERVAL must be between 1 and 1000000");
+            }
+            Ok(interval)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn transport_security_from_env(tls_enabled: bool) -> anyhow::Result<TransportSecurity> {
+    Ok(TransportSecurity {
+        tls_enabled,
+        require_https: bool_env("WARDEN_CP_REQUIRE_HTTPS")?,
+        trust_proxy_headers: bool_env("WARDEN_CP_TRUST_PROXY_HEADERS")?,
+    })
 }
 
 fn tls_paths_from_env() -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
@@ -126,9 +133,12 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://warden-cp.db".to_string());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
     let tls_paths = tls_paths_from_env()?;
-    let transport_security = transport_security_from_env(tls_paths.is_some());
+    let transport_security = transport_security_from_env(tls_paths.is_some())?;
     enforce_transport_security(&bind_addr, &transport_security)?;
-    let webhook_url = std::env::var("APPROVAL_WEBHOOK_URL").ok();
+    let webhook_url = std::env::var("APPROVAL_WEBHOOK_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let trust_domain = std::env::var("TRUST_DOMAIN").unwrap_or_else(|_| "warden.local".to_string());
     let signing_key_path = PathBuf::from(
         std::env::var("SIGNING_KEY_PATH").unwrap_or_else(|_| "warden-cp-signing.key".to_string()),
@@ -154,16 +164,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     routes::seal_legacy_audit_if_needed(&pool, signer.as_ref()).await?;
-    let chain_tail = load_chain_tail(&pool).await;
+    let chain_tail = load_chain_tail(&pool).await?;
     let oidc = oidc::OidcConfig::from_env()?.map(Arc::new);
     let audit_anchor = Arc::new(audit_anchor::AuditAnchor::from_env()?);
-    let audit_ml_dsa_checkpoint_interval = audit_ml_dsa_checkpoint_interval();
+    let audit_ml_dsa_checkpoint_interval = audit_ml_dsa_checkpoint_interval()?;
 
     let state = AppState {
         pool,
         signer,
         oidc,
-        notifier: Arc::new(notify::Notifier::new(webhook_url)),
+        notifier: Arc::new(notify::Notifier::new(webhook_url)?),
         trust_domain,
         audit_chain_tail: Arc::new(AsyncMutex::new(chain_tail)),
         audit_anchor,
@@ -205,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/approvals/:id", get(routes::get_approval))
         .route("/v1/approvals/:id/decide", post(routes::decide_approval))
+        .route("/v1/approvals/:id/consume", post(routes::consume_approval))
         .route("/v1/audit/verify", get(routes::verify_audit_chain))
         .route(
             "/v1/agent-sessions",
@@ -265,9 +276,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/oidc/login", get(oidc::login))
         .route("/oidc/callback", get(oidc::callback))
         .merge(protected)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             routes::require_https,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            routes::security_headers,
         ))
         .with_state(state);
 

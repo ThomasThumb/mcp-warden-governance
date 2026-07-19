@@ -55,7 +55,11 @@
       for (const [key, value] of Object.entries(data)) {
         const item = document.createElement("div");
         item.className = "metric";
-        item.innerHTML = `<span>${key}</span><strong>${value}</strong>`;
+        const label = document.createElement("span");
+        label.textContent = key;
+        const metric = document.createElement("strong");
+        metric.textContent = String(value);
+        item.append(label, metric);
         root.appendChild(item);
       }
     }

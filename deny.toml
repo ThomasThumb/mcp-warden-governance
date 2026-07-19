@@ -1,0 +1,59 @@
+# cargo-deny configuration for the whole workspace (both crates).
+# CI runs `cargo deny check` — all four checks: advisories, licenses,
+# bans, and sources.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+# Everything in the tree today resolves to one of these permissive licenses.
+# Adding a dependency outside this list should be a deliberate, reviewed act.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# New duplicate generations fail the build. These exact older generations are
+# temporarily accepted because the classical Ed25519/rustls/SQLx stack and the
+# newer ML-DSA/Regorus stack currently require incompatible major versions.
+# Cargo Deny warns when an exception stops matching, which makes stale entries
+# self-cleaning instead of silently allowing future duplicates.
+multiple-versions = "deny"
+wildcards = "deny"
+skip = [
+    { crate = "block-buffer@0.10.4", reason = "sha2 0.10 and ML-DSA's sha2 0.11 use different block-buffer generations" },
+    { crate = "cpufeatures@0.2.17", reason = "curve25519-dalek and sha2 0.10 have not moved to cpufeatures 0.3" },
+    { crate = "crypto-common@0.1.6", reason = "Ed25519 uses digest 0.10 while ML-DSA uses digest 0.11" },
+    { crate = "digest@0.10.7", reason = "Ed25519 and SQLx require digest 0.10; ML-DSA requires digest 0.11" },
+    { crate = "getrandom@0.2.17", reason = "ring and Ed25519 rand_core require getrandom 0.2; modern crypto uses 0.4" },
+    { crate = "hashbrown@0.16.1", reason = "SQLx hashlink uses 0.16 while current indexmap uses 0.17" },
+    { crate = "rand_core@0.6.4", reason = "ed25519-dalek requires rand_core 0.6; ML-DSA uses rand_core 0.10" },
+    { crate = "signature@2.2.0", reason = "Ed25519 and jsonwebtoken use signature 2; ML-DSA uses signature 3" },
+    { crate = "sha2@0.10.9", reason = "Ed25519 and SQLx use sha2 0.10 while ML-DSA uses sha2 0.11" },
+    { crate = "spin@0.9.9", reason = "SQLx flume and Regorus lazy_static use 0.9.9; Regorus directly uses 0.12" },
+    { crate = "syn@2.0.119", reason = "crypto and platform macros use syn 2 while current serde/rmcp use syn 3" },
+    { crate = "windows-sys@0.52.0", reason = "ring requires 0.52 on Windows while Tokio uses 0.61" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-git = [
+    "https://github.com/microsoft/regorus",
+]
+unused-allowed-source = "deny"
+
+[output]
+feature-depth = 1

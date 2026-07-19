@@ -1,20 +1,88 @@
+# Release pipeline: gate on the full test/audit suite, build and push the
+# image, sign + attest it, then VERIFY the signatures and attestations we
+# just published — so the verification commands documented in
+# SUPPLY_CHAIN.md are executed by the pipeline itself on every release.
+#
+# Conventions match security.yml: SHA-pinned actions (tag in comment),
+# --locked on every cargo invocation. Exception: the SLSA generator MUST be
+# referenced by tag — the slsa-framework verifier resolves and validates the
+# reusable workflow by its tagged release, and SHA references are unsupported.
 name: Release Provenance
 
 on:
   push:
     tags:
       - "v*"
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Test, audit, and deny before signing anything
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@6026fb2ad3aa556d78b517cf65c8c1f832075860 # v5
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Test workspace (sqlite default)
+        run: cargo test --workspace --locked
+
+      - name: Test warden-cp (postgres backend)
+        run: cargo test -p warden-cp --no-default-features --features postgres --locked
+
+      - name: Install cargo-audit and cargo-deny (prebuilt)
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit
+        run: cargo audit
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: Build release candidate for vulnerability scan
+        run: docker build -f warden-cp/Dockerfile -t warden-cp:release-gate .
+
+      - name: Build hardened PostgreSQL 17 image for vulnerability scan
+        run: docker build -f warden-cp/deploy/postgres/Dockerfile -t warden-postgres:release-gate .
+
+      - name: Scan release candidate for vulnerabilities and secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: warden-cp:release-gate
+          scanners: vuln,secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: "false"
+          exit-code: "1"
+          format: table
+
+      - name: Scan PostgreSQL image for vulnerabilities and secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: warden-postgres:release-gate
+          scanners: vuln,secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: "false"
+          exit-code: "1"
+          format: table
+
   build-sign-attest:
     name: Build, sign, and attest warden-cp image
     runs-on: ubuntu-latest
+    needs: [gate]
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -26,7 +94,7 @@ jobs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@6026fb2ad3aa556d78b517cf65c8c1f832075860 # v5
 
       - name: Resolve image name
         id: image
@@ -35,10 +103,10 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.11.1
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3.4.0
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -46,7 +114,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5.7.0
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
           images: ${{ steps.image.outputs.image }}
           tags: |
@@ -55,16 +123,21 @@ jobs:
 
       - name: Build and push Postgres image
         id: build
-        uses: docker/build-push-action@v6.18.0
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
-          context: ./warden-cp
+          # Workspace build: context is the repo root; see warden-cp/Dockerfile.
+          context: .
           file: ./warden-cp/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The SLSA generator job below is the single authoritative
+          # provenance source; BuildKit's default provenance would publish a
+          # second, weaker attestation for the same subject.
+          provenance: false
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.0
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
 
       - name: Sign image with Sigstore keyless
         env:
@@ -80,7 +153,7 @@ jobs:
           cosign sign --yes ${images}
 
       - name: Generate GitHub artifact attestation
-        uses: actions/attest@v4
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
         with:
           subject-name: ${{ steps.image.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -93,6 +166,8 @@ jobs:
       actions: read
       id-token: write
       packages: write
+    # Tag reference is REQUIRED here (not a missing SHA pin): the SLSA
+    # generator's own verification model only supports tagged releases.
     uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
     with:
       image: ${{ needs.build-sign-attest.outputs.image }}
@@ -100,3 +175,46 @@ jobs:
       registry-username: ${{ github.actor }}
     secrets:
       registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  verify-release:
+    name: Verify signatures and attestations post-publish
+    runs-on: ubuntu-latest
+    needs: [build-sign-attest, slsa-provenance]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build-sign-attest.outputs.image }}
+      DIGEST: ${{ needs.build-sign-attest.outputs.digest }}
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify cosign keyless signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/\.github/workflows/release-provenance\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Verify GitHub artifact attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${GITHUB_REPOSITORY}"
+
+      - name: Verify SLSA provenance attestation
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/\.github/workflows/generator_container_slsa3\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}"

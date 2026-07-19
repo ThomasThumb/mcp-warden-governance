@@ -19,7 +19,8 @@ live.
 - **Audit + approvals** - `POST /v1/audit` ingests the who/what/when/where
   ledger with hash chaining plus signed checkpoints; `POST /v1/approvals` +
   `GET/POST /v1/approvals/:id` is the step-up-approval workflow,
-  KISS-notified (see `notify.rs`).
+  KISS-notified (see `notify.rs`). Approved requests are atomically consumed
+  before the gateway calls an upstream, so one approval cannot be replayed.
 - **Admin/security visibility** - root can create non-root principals and
   API keys, revoke keys, and read summary, gateway, session, fingerprint, and
   audit-event views without connecting directly to the database.
@@ -78,7 +79,11 @@ SQLite/Postgres only; MySQL/RSA is not pulled in.
 ### Postgres quick start
 
 The repo includes a minimal Postgres deployment under `deploy/postgres/`.
-It keeps both Postgres and `warden-cp` bound to localhost by default.
+It keeps Postgres on an internal-only network and binds `warden-cp` to
+localhost by default. The deployment preserves PostgreSQL 17 data compatibility
+and rebuilds its small `gosu` privilege-drop helper with a fixed, digest-pinned
+Go toolchain; CI scans both resulting images and fails on any vulnerability or
+embedded secret.
 
 ```bash
 cd deploy/postgres
@@ -216,10 +221,12 @@ and signatures.
 ## Security hardening (this round)
 
 Key holes from v0.1 are fixed:
-- **Every endpoint now requires `Authorization: Bearer <key>`.** First run
-  prints a root key once (`auth.rs::bootstrap_root_key_if_needed`) - save it,
-  it can't be recovered, only revoked. `decide_approval`'s `decided_by` now
-  comes from that authenticated identity, not a field in the request body.
+- **Every control-plane API endpoint requires `Authorization: Bearer <key>`.**
+  The static admin shell and OIDC login/callback must remain reachable before
+  API authentication, but they expose no protected API data. First run prints
+  a root key once (`auth.rs::bootstrap_root_key_if_needed`) - save it; it can't
+  be recovered, only revoked. `decide_approval`'s `decided_by` now comes from
+  that authenticated identity, not a field in the request body.
 - **The signing key persists for local dev** (`SIGNING_KEY_PATH`, default
   `warden-cp-signing.key`, written with owner-only permissions). Production
   can set `WARDEN_SIGNER_COMMAND` so private signing keys stay outside the
@@ -302,10 +309,7 @@ See `COMPLIANCE.md` for how these map to SOC 2 / ISO 42001 / EU AI Act.
 ## Setup
 
 ```bash
-# Same toolchain note as mcp-warden: needs Rust 1.85+ (edition 2024).
-# Unlike rmcp, everything here (axum, sqlx, ed25519-dalek) is a mainstream,
-# slow-moving crate, so `cargo check` should need little to no adjustment -
-# the risk profile here is much lower than the gateway's rmcp dependency.
+# The workspace pins Rust 1.95 in ../rust-toolchain.toml.
 
 export DATABASE_URL="sqlite://warden-cp.db"
 export BIND_ADDR="127.0.0.1:7878"

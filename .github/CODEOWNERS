@@ -1,0 +1,3 @@
+# Require review from the repository owner for every tracked path. Branch
+# protection should make CODEOWNERS review mandatory on the default branch.
+* @ThomasThumb

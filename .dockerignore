@@ -1,0 +1,17 @@
+# Build context is the repo root (see warden-cp/Dockerfile).
+target
+**/target
+.git
+.github
+artifacts
+exports
+backups
+*.zip
+*.db
+*.sqlite
+*signing.key
+**/deploy/postgres/.env
+report.md
+findings.json
+coverage.json
+scan-manifest*

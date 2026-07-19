@@ -20,17 +20,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-// ---------------------------------------------------------------------------
-// VERIFY-AGAINST-DOCS NOTE: the ServerHandler trait shape below (get_info /
-// list_tools / call_tool signatures, ListToolsResult::with_all_items,
-// ErrorData construction) is confirmed against the SDK's own source and
-// README examples as of this writing. rmcp has shipped breaking changes
-// across versions before, so if `cargo check` flags a mismatch here, it's
-// almost always a renamed type/method with the same *purpose* - check
-// `cargo doc -p rmcp --open` -> `rmcp::handler::server::ServerHandler` for
-// the current signatures and adjust just the signature, not the logic.
-// ---------------------------------------------------------------------------
-
 use crate::rego_policy::{PolicyInput, RegoPolicy};
 
 const SEP: &str = "::";
@@ -40,6 +29,10 @@ const ARG_WARDEN_TOKEN: &str = "__warden_token";
 const META_WARDEN_PROOF: &str = "warden_proof";
 const META_WARDEN_PROOF_QUALIFIED: &str = "io.linage/warden_proof";
 const ARG_WARDEN_PROOF: &str = "__warden_proof";
+const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_RESULT_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOKEN_BYTES: usize = 128 * 1024;
+const MAX_PROOF_BYTES: usize = 4 * 1024;
 
 pub struct Gateway {
     upstreams: Vec<Upstream>,
@@ -49,6 +42,8 @@ pub struct Gateway {
     config: WardenConfig,
     rego: Option<RegoPolicy>,
     cp: Option<CpClient>,
+    degraded_until: Option<chrono::DateTime<chrono::Utc>>,
+    degraded_jtis: Mutex<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -71,6 +66,7 @@ impl Gateway {
         integrity: IntegrityGuard,
         rego: Option<RegoPolicy>,
         cp: Option<CpClient>,
+        degraded_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Self {
         let injection_filter = InjectionFilter::new(config.injection_filter.block_threshold);
         let audit = AuditLog::new(&config.state_dir);
@@ -82,6 +78,8 @@ impl Gateway {
             config,
             rego,
             cp,
+            degraded_until,
+            degraded_jtis: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,7 +97,13 @@ impl Gateway {
         // rmcp version exposes (commonly named after JSON-RPC error kinds,
         // e.g. invalid_params / invalid_request). Centralized here on purpose
         // so a version mismatch is a one-line fix, not a scattered one.
-        McpError::invalid_params(msg.into(), None)
+        Self::deny_with("request_denied", msg, json!({}))
+    }
+
+    fn deny_with(code: &str, msg: impl Into<String>, fields: serde_json::Value) -> McpError {
+        let mut details = fields.as_object().cloned().unwrap_or_default();
+        details.insert("code".to_string(), json!(code));
+        McpError::invalid_params(msg.into(), Some(json!({ "warden": details })))
     }
 
     fn merge_policy_bundle(local: &UpstreamConfig, bundle: &serde_json::Value) -> UpstreamConfig {
@@ -147,8 +151,32 @@ impl Gateway {
         injection_flags: &[&'static str],
         result_bytes: Option<usize>,
     ) {
+        if let Err(e) = self
+            .write_audit(
+                identity,
+                tool,
+                decision,
+                args_fingerprint,
+                injection_flags,
+                result_bytes,
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to persist audit event");
+        }
+    }
+
+    async fn write_audit(
+        &self,
+        identity: &CallIdentity,
+        tool: (&str, &str),
+        decision: &str,
+        args_fingerprint: String,
+        injection_flags: &[&'static str],
+        result_bytes: Option<usize>,
+    ) -> anyhow::Result<()> {
         let (server_id, tool_name) = tool;
-        if let Err(e) = self.audit.record(&AuditEvent {
+        self.audit.record(&AuditEvent {
             ts: AuditLog::now(),
             server: server_id,
             tool: tool_name,
@@ -156,9 +184,7 @@ impl Gateway {
             args_fingerprint: args_fingerprint.clone(),
             injection_flags,
             result_bytes,
-        }) {
-            tracing::warn!(error = %e, "failed to write local audit event");
-        }
+        })?;
 
         if let Some(cp) = &self.cp {
             let event = json!({
@@ -172,10 +198,9 @@ impl Gateway {
                 "injection_flags": injection_flags,
                 "result_bytes": result_bytes.map(|bytes| bytes as i64),
             });
-            if let Err(e) = cp.submit_audit(&[event]).await {
-                tracing::warn!(error = %e, "failed to submit audit event to control plane");
-            }
+            cp.submit_audit(&[event]).await?;
         }
+        Ok(())
     }
 
     fn take_agent_credentials(
@@ -258,6 +283,20 @@ impl Gateway {
             }
             return Ok(CallIdentity::default());
         };
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(Self::deny_with(
+                "invalid_agent_token",
+                "agent token exceeds the accepted size limit",
+                json!({}),
+            ));
+        }
+        if proof.is_some_and(|value| value.len() > MAX_PROOF_BYTES) {
+            return Err(Self::deny_with(
+                "invalid_agent_proof",
+                "agent proof exceeds the accepted size limit",
+                json!({}),
+            ));
+        }
         let Some(signer_key) = cp_cfg.signer_public_key_b64.as_deref() else {
             if cp_cfg.require_agent_token {
                 return Err(Self::deny(
@@ -275,7 +314,10 @@ impl Gateway {
             &token_audience(&cp_cfg.gateway_id, server_id, tool_name),
             token,
         )
-        .map_err(|e| Self::deny(format!("invalid agent token: {e}")))?;
+        .map_err(|e| {
+            tracing::info!(error = %e, "rejected invalid agent token");
+            Self::deny_with("invalid_agent_token", "invalid agent token", json!({}))
+        })?;
         if claims.gateway_id != cp_cfg.gateway_id {
             return Err(Self::deny("agent token is scoped to a different gateway"));
         }
@@ -299,19 +341,28 @@ impl Gateway {
                 ));
             };
             verify_agent_proof(&cnf.ed25519_public_key_b64, token, args_fingerprint, proof)
-                .map_err(|e| Self::deny(format!("invalid agent proof: {e}")))?;
+                .map_err(|e| {
+                    tracing::info!(error = %e, "rejected invalid agent proof");
+                    Self::deny_with("invalid_agent_proof", "invalid agent proof", json!({}))
+                })?;
         }
 
         if cp_cfg.require_token_introspection {
             let Some(cp) = &self.cp else {
-                return Err(Self::deny(
-                    "token introspection is required but no control-plane client is configured",
-                ));
+                self.consume_degraded_jti(claims.jti.as_deref(), claims.exp)?;
+                return Ok(CallIdentity {
+                    agent_session_id: agent_session_id_from_spiffe(&claims.sub),
+                    principal_id: Some(claims.act.sub),
+                });
             };
-            let introspection = cp
-                .introspect_token(token)
-                .await
-                .map_err(|e| Self::deny(format!("token introspection failed: {e}")))?;
+            let introspection = cp.introspect_token(token).await.map_err(|e| {
+                tracing::warn!(error = %e, "control-plane token introspection failed");
+                Self::deny_with(
+                    "token_introspection_unavailable",
+                    "token introspection is unavailable",
+                    json!({}),
+                )
+            })?;
             if !introspection.active {
                 return Err(Self::deny(format!(
                     "agent token is inactive: {}",
@@ -349,6 +400,49 @@ impl Gateway {
             principal_id: Some(claims.act.sub),
         })
     }
+
+    fn consume_degraded_jti(&self, jti: Option<&str>, exp: i64) -> Result<(), McpError> {
+        let now = chrono::Utc::now();
+        let Some(until) = self.degraded_until else {
+            return Err(Self::deny_with(
+                "token_introspection_unavailable",
+                "token introspection is required but the control plane is unavailable",
+                json!({}),
+            ));
+        };
+        if until <= now {
+            return Err(Self::deny_with(
+                "degraded_window_expired",
+                "the acknowledged degraded-mode window has expired",
+                json!({ "degraded_until": until.to_rfc3339() }),
+            ));
+        }
+        let Some(jti) = jti.filter(|value| !value.is_empty()) else {
+            return Err(Self::deny_with(
+                "invalid_agent_token",
+                "agent token is missing token id",
+                json!({}),
+            ));
+        };
+        let now_ts = now.timestamp();
+        let mut seen = self.degraded_jtis.lock().map_err(|_| {
+            Self::deny_with(
+                "internal_error",
+                "gateway security state is unavailable",
+                json!({}),
+            )
+        })?;
+        seen.retain(|_, expires_at| *expires_at > now_ts);
+        if seen.contains_key(jti) {
+            return Err(Self::deny_with(
+                "replayed_agent_token",
+                "agent token id was already used during degraded mode",
+                json!({}),
+            ));
+        }
+        seen.insert(jti.to_string(), exp);
+        Ok(())
+    }
 }
 
 impl ServerHandler for Gateway {
@@ -376,7 +470,13 @@ impl ServerHandler for Gateway {
                 // Operate on the JSON form rather than guessing Tool's exact
                 // public fields - this survives model-struct renames across
                 // rmcp versions far better than struct-literal reconstruction.
-                let mut value = serde_json::to_value(&tool).unwrap_or(json!({}));
+                let mut value = match serde_json::to_value(&tool) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!(server = %upstream.config.id, error = %e, "failed to serialize upstream tool definition");
+                        continue;
+                    }
+                };
                 let original_name = value
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -385,7 +485,13 @@ impl ServerHandler for Gateway {
 
                 // --- Layer 1: tool poisoning / rug-pull detection ---
                 let key = format!("{}{SEP}{}", upstream.config.id, original_name);
-                let fingerprint = IntegrityGuard::fingerprint(&value);
+                let fingerprint = match IntegrityGuard::fingerprint(&value) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(e) => {
+                        tracing::error!(server = %upstream.config.id, error = %e, "failed to fingerprint upstream tool definition");
+                        continue;
+                    }
+                };
                 let is_known_good = if let Some(cp) = &self.cp {
                     match cp
                         .report_fingerprint(&upstream.config.id, &original_name, &fingerprint)
@@ -410,8 +516,20 @@ impl ServerHandler for Gateway {
                         }
                     }
                 } else {
-                    let mut guard = self.integrity.lock().unwrap();
-                    guard.check_and_record(&key, &value).unwrap_or(false)
+                    let mut guard = match self.integrity.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            tracing::error!(error = %e, "tool-integrity state lock is poisoned");
+                            continue;
+                        }
+                    };
+                    match guard.check_and_record(&key, &value) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            tracing::error!(error = %e, %key, "failed to persist tool-integrity state");
+                            false
+                        }
+                    }
                 };
                 if !is_known_good {
                     tracing::warn!(%key, "tool is new or changed since last approval - withholding until `mcp-warden approve` is run");
@@ -433,8 +551,11 @@ impl ServerHandler for Gateway {
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("name".to_string(), json!(key));
                 }
-                if let Ok(renamed) = serde_json::from_value::<Tool>(value) {
-                    merged.push(renamed);
+                match serde_json::from_value::<Tool>(value) {
+                    Ok(renamed) => merged.push(renamed),
+                    Err(e) => {
+                        tracing::warn!(%key, error = %e, "failed to rebuild namespaced tool definition")
+                    }
                 }
             }
         }
@@ -464,7 +585,18 @@ impl ServerHandler for Gateway {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Null);
-        let args_fingerprint = AuditLog::fingerprint_args(&args_value);
+        let args_len = serde_json::to_vec(&args_value)
+            .map_err(|_| Self::deny("tool arguments are not serializable"))?
+            .len();
+        if args_len > MAX_ARGUMENT_BYTES {
+            return Err(Self::deny_with(
+                "arguments_too_large",
+                "tool arguments exceed the accepted size limit",
+                json!({ "max_bytes": MAX_ARGUMENT_BYTES }),
+            ));
+        }
+        let args_fingerprint = AuditLog::fingerprint_args(&args_value)
+            .map_err(|_| Self::deny("tool arguments could not be fingerprinted"))?;
 
         let identity = match self
             .verify_call_identity(
@@ -515,7 +647,7 @@ impl ServerHandler for Gateway {
         let policy_input = PolicyInput {
             server_id: server_id.to_string(),
             tool_name: tool_name.to_string(),
-            args_byte_len: args_value.to_string().len(),
+            args_byte_len: args_len,
             hour_of_day_utc: now.format("%H").to_string().parse().unwrap_or(0),
             weekday_utc: now.format("%u").to_string().parse::<u32>().unwrap_or(1) - 1,
             agent_principal: identity.principal_id.clone(),
@@ -527,7 +659,9 @@ impl ServerHandler for Gateway {
             tool_name,
             self.rego.as_ref(),
             Some(&policy_input),
-        ) {
+        )
+        .await
+        {
             policy::Decision::Deny(reason) => {
                 self.record_audit(
                     &identity,
@@ -542,7 +676,7 @@ impl ServerHandler for Gateway {
             }
             policy::Decision::RequireApproval => {
                 if let Some(cp) = &self.cp {
-                    let approval_id = match cp
+                    let approval = match cp
                         .create_approval(
                             identity.agent_session_id.as_deref(),
                             server_id,
@@ -552,7 +686,7 @@ impl ServerHandler for Gateway {
                         )
                         .await
                     {
-                        Ok(id) if !id.is_empty() => id,
+                        Ok(approval) if !approval.id.is_empty() => approval,
                         Ok(_) => {
                             self.record_audit(
                                 &identity,
@@ -575,23 +709,35 @@ impl ServerHandler for Gateway {
                                 None,
                             )
                             .await;
-                            return Err(Self::deny(format!(
-                                "failed to create control-plane approval: {e}"
-                            )));
+                            tracing::warn!(error = %e, "failed to create or recover control-plane approval");
+                            return Err(Self::deny_with(
+                                "approval_unavailable",
+                                "control-plane approval is unavailable",
+                                json!({}),
+                            ));
                         }
                     };
-
-                    let status = cp.poll_approval(&approval_id).await.unwrap_or_else(|e| {
-                        tracing::warn!(
-                            approval_id = %approval_id,
-                            error = %e,
-                            "failed to poll control-plane approval"
-                        );
-                        "pending".to_string()
-                    });
-
-                    match status.as_str() {
-                        "approved" => {}
+                    let approval_id = approval.id;
+                    match approval.status.as_str() {
+                        "approved" => {
+                            if let Err(e) = cp.consume_approval(&approval_id).await {
+                                tracing::warn!(approval_id = %approval_id, error = %e, "approved request could not be consumed");
+                                self.record_audit(
+                                    &identity,
+                                    (server_id, tool_name),
+                                    "denied",
+                                    args_fingerprint,
+                                    &[],
+                                    None,
+                                )
+                                .await;
+                                return Err(Self::deny_with(
+                                    "approval_not_consumed",
+                                    "approval is no longer available for this call",
+                                    json!({ "approval_id": approval_id }),
+                                ));
+                            }
+                        }
                         "denied" => {
                             self.record_audit(
                                 &identity,
@@ -606,7 +752,7 @@ impl ServerHandler for Gateway {
                                 "'{qualified}' was denied by control-plane approval {approval_id}"
                             )));
                         }
-                        _ => {
+                        "pending" => {
                             self.record_audit(
                                 &identity,
                                 (server_id, tool_name),
@@ -616,9 +762,19 @@ impl ServerHandler for Gateway {
                                 None,
                             )
                             .await;
-                            return Err(Self::deny(format!(
-                                "'{qualified}' requires approval {approval_id}; status is {status}, so this call was not sent upstream"
-                            )));
+                            return Err(Self::deny_with(
+                                "approval_pending",
+                                format!("'{qualified}' requires human approval"),
+                                json!({ "approval_id": approval_id, "status": "pending" }),
+                            ));
+                        }
+                        status => {
+                            tracing::error!(approval_id = %approval_id, %status, "control plane returned an invalid approval status");
+                            return Err(Self::deny_with(
+                                "approval_invalid_status",
+                                "control plane returned an invalid approval status",
+                                json!({ "approval_id": approval_id }),
+                            ));
                         }
                     }
                 } else {
@@ -657,11 +813,35 @@ impl ServerHandler for Gateway {
             ));
         }
 
+        // Persist authorization intent before crossing the upstream side-effect
+        // boundary. If either the durable local log or configured control-plane
+        // ledger is unavailable, do not execute the tool.
+        self.write_audit(
+            &identity,
+            (server_id, tool_name),
+            "authorized",
+            args_fingerprint.clone(),
+            &arg_hits,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(server = %server_id, tool = %tool_name, error = %e, "required pre-execution audit failed");
+            Self::deny_with(
+                "audit_unavailable",
+                "required audit persistence is unavailable",
+                json!({}),
+            )
+        })?;
+
         // --- Forward to the real upstream ---
         let mut result = upstream
             .call_tool(tool_name, arguments)
             .await
-            .map_err(|e| Self::deny(format!("upstream call failed: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(server = %server_id, tool = %tool_name, error = %e, "upstream call failed");
+                Self::deny_with("upstream_failure", "upstream tool call failed", json!({}))
+            })?;
 
         // --- Layer 5: scan the RESULT too - indirect injection usually rides
         // in through fetched data, not the initial call ---
@@ -673,7 +853,14 @@ impl ServerHandler for Gateway {
                 match item.as_text() {
                     Some(text_content) => {
                         let text = &text_content.text;
-                        result_bytes += text.len();
+                        result_bytes = result_bytes.saturating_add(text.len());
+                        if result_bytes > MAX_RESULT_TEXT_BYTES {
+                            return Err(Self::deny_with(
+                                "result_too_large",
+                                "tool result exceeds the accepted text size limit",
+                                json!({ "max_bytes": MAX_RESULT_TEXT_BYTES }),
+                            ));
+                        }
                         let hits = self.injection_filter.scan(text);
                         if !hits.is_empty() {
                             result_flags.extend(hits.iter());
@@ -745,7 +932,7 @@ impl ServerHandler for Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Transport;
+    use crate::config::{ControlPlaneConfig, InjectionFilterConfig, Transport};
 
     fn local_config() -> UpstreamConfig {
         let mut tools = HashMap::new();
@@ -762,6 +949,7 @@ mod tests {
                 command: "true".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
+                env_from: HashMap::new(),
                 sandbox: None,
             },
             default_risk: RiskTier::RequireApproval,
@@ -808,5 +996,53 @@ mod tests {
             merged.tools.get("write_file").and_then(|p| p.risk),
             Some(RiskTier::RequireApproval)
         );
+    }
+
+    #[test]
+    fn degraded_mode_consumes_each_token_id_once_and_expires() {
+        let state_dir = std::env::temp_dir().join(format!("mcp-gateway-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config = WardenConfig {
+            servers: Vec::new(),
+            state_dir: state_dir.clone(),
+            injection_filter: InjectionFilterConfig::default(),
+            control_plane: Some(ControlPlaneConfig {
+                url: "https://cp.example.com".into(),
+                gateway_id: "gateway-1".into(),
+                owner_principal_id: "owner-1".into(),
+                api_key_env: "CP_KEY".into(),
+                max_degraded_minutes: 60,
+                signer_public_key_b64: None,
+                ml_dsa_public_key_b64: None,
+                require_ml_dsa_token_signature: true,
+                require_agent_token: true,
+                require_agent_proof: true,
+                require_token_introspection: true,
+            }),
+            rego_policy_path: None,
+        };
+        let integrity = IntegrityGuard::load(&state_dir).unwrap();
+        let gateway = Gateway::new(
+            config.clone(),
+            Vec::new(),
+            integrity,
+            None,
+            None,
+            Some(chrono::Utc::now() + chrono::Duration::minutes(1)),
+        );
+        let exp = chrono::Utc::now().timestamp() + 60;
+        gateway.consume_degraded_jti(Some("jti-1"), exp).unwrap();
+        assert!(gateway.consume_degraded_jti(Some("jti-1"), exp).is_err());
+
+        let expired = Gateway::new(
+            config,
+            Vec::new(),
+            IntegrityGuard::load(&state_dir).unwrap(),
+            None,
+            None,
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+        );
+        assert!(expired.consume_degraded_jti(Some("jti-2"), exp).is_err());
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

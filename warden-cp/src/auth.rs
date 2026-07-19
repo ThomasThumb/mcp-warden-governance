@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -48,11 +48,8 @@ where
     }
 }
 
-/// VERIFY-AGAINST-DOCS NOTE: this is axum 0.7's `middleware::from_fn_with_state`
-/// shape (State extractor, owned Request, Next). If your resolved axum
-/// version renamed anything here, the logic (pull bearer token -> hash ->
-/// look up -> stash principal in extensions -> reject if missing) is what
-/// matters; the exact extractor plumbing is what to diff against current docs.
+/// Authentication middleware: resolve a bearer token to an active principal
+/// and make that identity available to downstream authorization checks.
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -118,31 +115,59 @@ pub async fn require_auth(
 /// somewhere real (a password manager, a vault), because it can't be
 /// recovered, only revoked and replaced.
 pub async fn bootstrap_root_key_if_needed(pool: &DbPool) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO principal_roles (principal_id, role)
-         SELECT id, 'root_admin' FROM principals WHERE display_name = 'root-admin'
-         ON CONFLICT(principal_id, role) DO NOTHING",
-    )
-    .execute(pool)
-    .await?;
-
-    let count_row = sqlx::query("SELECT COUNT(*) as c FROM principals")
-        .fetch_one(pool)
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = pool.begin().await?;
+    // This no-op update obtains a database write lock before the existence
+    // checks on both SQLite and Postgres.
+    sqlx::query("UPDATE bootstrap_lock SET touched_at = $1 WHERE id = 1")
+        .bind(&now)
+        .execute(&mut *transaction)
         .await?;
-    let count: i64 = count_row.try_get("c").unwrap_or(0);
+    let count_row = sqlx::query("SELECT COUNT(*) as c FROM principals")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let count: i64 = count_row.try_get("c")?;
     if count > 0 {
+        let root_count: i64 =
+            sqlx::query("SELECT COUNT(*) AS c FROM principal_roles WHERE role = 'root_admin'")
+                .fetch_one(&mut *transaction)
+                .await?
+                .try_get("c")?;
+        if root_count > 0 {
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        // One-time migration for a pre-role database. Once any root role
+        // exists, display names never confer privilege.
+        let candidates = sqlx::query(
+            "SELECT id FROM principals WHERE display_name = 'root-admin' ORDER BY created_at",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        if candidates.len() != 1 {
+            anyhow::bail!(
+                "database has principals but no root_admin role and {} legacy root-admin candidates; refusing ambiguous privilege migration",
+                candidates.len()
+            );
+        }
+        let root_id: String = candidates[0].try_get("id")?;
+        sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES ($1, 'root_admin')")
+            .bind(root_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         return Ok(());
     }
 
     let principal_id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO principals (id, kind, display_name, external_id, created_at)
          VALUES ($1, 'service', 'root-admin', NULL, $2)",
     )
     .bind(&principal_id)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     let raw_key = random_bearer_token("warden_root");
@@ -154,13 +179,15 @@ pub async fn bootstrap_root_key_if_needed(pool: &DbPool) -> anyhow::Result<()> {
     .bind(&principal_id)
     .bind(hash_key(&raw_key))
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     sqlx::query("INSERT INTO principal_roles (principal_id, role) VALUES ($1, 'root_admin')")
         .bind(&principal_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
+
+    transaction.commit().await?;
 
     eprintln!("=======================================================================");
     eprintln!(" First run: created root principal {principal_id}");
@@ -169,4 +196,66 @@ pub async fn bootstrap_root_key_if_needed(pool: &DbPool) -> anyhow::Result<()> {
     eprintln!(" Every request needs: Authorization: Bearer <key>");
     eprintln!("=======================================================================");
     Ok(())
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> DbPool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        MIGRATOR.run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_principal(pool: &DbPool, id: &str, name: &str) {
+        sqlx::query(
+            "INSERT INTO principals (id, kind, display_name, active, created_at)
+             VALUES ($1, 'service', $2, 1, $3)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_root_migration_runs_once_and_never_promotes_by_name_again() {
+        let pool = test_pool().await;
+        insert_principal(&pool, "legacy", "root-admin").await;
+        bootstrap_root_key_if_needed(&pool).await.unwrap();
+
+        insert_principal(&pool, "lookalike", "root-admin").await;
+        bootstrap_root_key_if_needed(&pool).await.unwrap();
+
+        let rows = sqlx::query(
+            "SELECT principal_id FROM principal_roles WHERE role = 'root_admin' ORDER BY principal_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].try_get::<String, _>("principal_id").unwrap(),
+            "legacy"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_legacy_root_migration_fails_closed() {
+        let pool = test_pool().await;
+        insert_principal(&pool, "first", "root-admin").await;
+        insert_principal(&pool, "second", "root-admin").await;
+        let error = bootstrap_root_key_if_needed(&pool).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing ambiguous privilege migration"));
+    }
 }

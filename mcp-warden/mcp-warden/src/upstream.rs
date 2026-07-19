@@ -2,6 +2,7 @@ use crate::config::{
     OAuthClientCredentials, SandboxConfig, SandboxMode, Transport, UpstreamConfig,
 };
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::{RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -10,6 +11,9 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
+
+const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_RPC_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // A note on API stability: rmcp is under active development (it went from
@@ -53,18 +57,22 @@ impl Upstream {
                 command,
                 args,
                 env,
+                env_from,
                 sandbox,
             } => {
                 let cmd_args = args.clone();
-                let env_vars = env.clone();
+                let mut env_vars = env.clone();
+                for (child_name, parent_name) in &env_from {
+                    let value = std::env::var(parent_name).with_context(|| {
+                        format!(
+                            "missing parent environment variable {parent_name} required as {child_name}"
+                        )
+                    })?;
+                    env_vars.insert(child_name.clone(), value);
+                }
                 let child = TokioChildProcess::new(
                     build_stdio_command(&command, &cmd_args, &env_vars, sandbox.as_ref())?
-                        .configure(move |cmd| {
-                            cmd.args(&cmd_args);
-                            for (k, v) in &env_vars {
-                                cmd.env(k, v);
-                            }
-                        }),
+                        .configure(move |cmd| configure_stdio_process(cmd, &cmd_args, &env_vars)),
                 )?;
                 let service = ().serve(child).await?;
                 Ok(Self {
@@ -84,6 +92,8 @@ impl Upstream {
                     oauth,
                     http: reqwest::Client::builder()
                         .timeout(Duration::from_secs(30))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .no_proxy()
                         .build()
                         .context("building HTTP upstream client")?,
                     next_id: AtomicU64::new(1),
@@ -117,6 +127,19 @@ impl Upstream {
     }
 }
 
+fn configure_stdio_process(
+    cmd: &mut Command,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+) {
+    // A child MCP server is an untrusted security boundary. Start with an
+    // empty environment and pass only config-declared values.
+    cmd.env_clear();
+    cmd.args(args);
+    cmd.envs(env);
+    cmd.kill_on_drop(true);
+}
+
 impl HttpUpstream {
     async fn bearer_token(&self) -> Result<Option<String>> {
         if let Some(env_name) = &self.token_env {
@@ -135,7 +158,7 @@ impl HttpUpstream {
                 oauth.client_secret_env
             )
         })?;
-        let token: OAuthTokenResponse = self
+        let response = self
             .http
             .post(&oauth.token_url)
             .basic_auth(client_id, Some(client_secret))
@@ -146,9 +169,9 @@ impl HttpUpstream {
             ])
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let token: OAuthTokenResponse =
+            response_json_limited(response, MAX_OAUTH_RESPONSE_BYTES).await?;
         Ok(Some(token.access_token))
     }
 
@@ -163,7 +186,14 @@ impl HttpUpstream {
         if let Some(token) = self.bearer_token().await? {
             request = request.bearer_auth(token);
         }
-        let value: serde_json::Value = request.send().await?.error_for_status()?.json().await?;
+        let response = request.send().await?.error_for_status()?;
+        let value: serde_json::Value =
+            response_json_limited(response, MAX_RPC_RESPONSE_BYTES).await?;
+        if value.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0")
+            || value.get("id").and_then(|value| value.as_u64()) != Some(id)
+        {
+            bail!("upstream HTTP RPC {method} returned a mismatched JSON-RPC envelope");
+        }
         if let Some(error) = value.get("error") {
             bail!("upstream HTTP RPC {method} failed: {error}");
         }
@@ -200,6 +230,28 @@ impl HttpUpstream {
     }
 }
 
+async fn response_json_limited<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("upstream response exceeds the {limit}-byte limit");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("upstream response exceeds the {limit}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(Into::into)
+}
+
 fn build_stdio_command(
     command: &str,
     _args: &[String],
@@ -232,7 +284,7 @@ fn build_stdio_command(
                     .arg("--chdir")
                     .arg("/workspace");
             }
-            cmd.args(&sandbox.extra_args).arg("--").arg(command);
+            cmd.arg("--").arg(command);
             Ok(cmd)
         }
         SandboxMode::Firejail => {
@@ -244,7 +296,7 @@ fn build_stdio_command(
             if let Some(workspace) = &sandbox.workspace {
                 cmd.arg(format!("--private={}", workspace.display()));
             }
-            cmd.args(&sandbox.extra_args).arg("--").arg(command);
+            cmd.arg("--").arg(command);
             Ok(cmd)
         }
         SandboxMode::Docker => {
@@ -263,11 +315,60 @@ fn build_stdio_command(
                     .arg(format!("{}:/workspace:rw", workspace.display()))
                     .args(["-w", "/workspace"]);
             }
-            for (key, value) in env {
-                cmd.arg("-e").arg(format!("{key}={value}"));
+            for key in env.keys() {
+                // The Docker CLI inherits only the explicit allowlist. Passing
+                // names (not values) keeps secrets out of process listings.
+                cmd.arg("-e").arg(key);
             }
-            cmd.args(&sandbox.extra_args).arg(image).arg(command);
+            cmd.arg(image).arg(command);
             Ok(cmd)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn stdio_child_receives_only_allowlisted_environment() {
+        let mut env = HashMap::new();
+        env.insert("ALLOWED".to_string(), "yes".to_string());
+
+        #[cfg(windows)]
+        let (program, args) = {
+            let system_root =
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+            (
+                std::path::PathBuf::from(system_root)
+                    .join("System32")
+                    .join("cmd.exe"),
+                vec![
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    "echo secret=%MCP_WARDEN_PARENT_SECRET% allowed=%ALLOWED%".to_string(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (program, args) = (
+            std::path::PathBuf::from("/bin/sh"),
+            vec![
+                "-c".to_string(),
+                "printf 'secret=%s allowed=%s' \"$MCP_WARDEN_PARENT_SECRET\" \"$ALLOWED\""
+                    .to_string(),
+            ],
+        );
+
+        let mut command = Command::new(program);
+        command.env("MCP_WARDEN_PARENT_SECRET", "should_not_leak");
+        configure_stdio_process(&mut command, &args, &env);
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("allowed=yes"));
+        assert!(!stdout.contains("should_not_leak"));
     }
 }

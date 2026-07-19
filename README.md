@@ -29,6 +29,9 @@ This repository has two main components:
   adapters.
 - Support OIDC login and SCIM user/group lifecycle sync.
 - Run on SQLite for local development or Postgres for production.
+- Keep control-plane and upstream secrets out of TOML through explicit
+  environment-variable mappings; spawned adapters and stdio servers inherit
+  an empty environment unless a value is allowlisted.
 - Serve `warden-cp` over built-in Rustls TLS or enforce HTTPS behind a trusted
   reverse proxy.
 - Build signed/provenance-backed release images through GitHub Actions,

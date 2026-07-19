@@ -1,0 +1,6 @@
+# Pin the toolchain so local builds, CI, and release images agree.
+# Bump deliberately (Dependabot does not manage this file); CI installs
+# exactly this version via `rustup toolchain install`.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

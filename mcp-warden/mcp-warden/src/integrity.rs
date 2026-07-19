@@ -46,11 +46,11 @@ impl IntegrityGuard {
     /// Hash the *entire* tool definition (name + description + input schema),
     /// not just the description string. Attackers hide instructions in schema
     /// field names and enum values too, not only the description field.
-    pub fn fingerprint(definition: &serde_json::Value) -> String {
-        let canonical = serde_json::to_vec(definition).unwrap_or_default();
+    pub fn fingerprint(definition: &serde_json::Value) -> anyhow::Result<String> {
+        let canonical = serde_json::to_vec(definition)?;
         let mut hasher = Sha256::new();
         hasher.update(&canonical);
-        format!("{:x}", hasher.finalize())
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     /// true  -> known-good, unchanged since last approval, safe to expose
@@ -61,7 +61,7 @@ impl IntegrityGuard {
         key: &str,
         definition: &serde_json::Value,
     ) -> anyhow::Result<bool> {
-        let new_hash = Self::fingerprint(definition);
+        let new_hash = Self::fingerprint(definition)?;
         let outcome = match self.store.approved.get(key) {
             Some(existing) if *existing == new_hash => true,
             Some(existing) => {

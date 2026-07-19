@@ -18,11 +18,32 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn new(webhook_url: Option<String>) -> Self {
-        Self {
-            webhook_url,
-            client: reqwest::Client::new(),
+    pub fn new(webhook_url: Option<String>) -> anyhow::Result<Self> {
+        if let Some(url) = &webhook_url {
+            let parsed = reqwest::Url::parse(url)?;
+            let loopback = parsed.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+            if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+                anyhow::bail!(
+                    "WEBHOOK_URL must use HTTPS (HTTP is allowed only for loopback development)"
+                );
+            }
+            if parsed.username() != "" || parsed.password().is_some() {
+                anyhow::bail!("WEBHOOK_URL must not contain embedded credentials");
+            }
         }
+        Ok(Self {
+            webhook_url,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()?,
+        })
     }
 
     pub async fn notify_pending(&self, req: &ApprovalRequest) {
@@ -37,8 +58,18 @@ impl Notifier {
         // Slack-compatible body ({"text": ...}); a custom dashboard endpoint
         // can just read whichever field it cares about and ignore the rest.
         let body = json!({ "text": text, "approval": req });
-        if let Err(e) = self.client.post(url).json(&body).send().await {
-            tracing::warn!(error = %e, "failed to deliver approval notification");
+        if self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .is_err()
+        {
+            // reqwest errors may contain the full webhook URL. Slack and
+            // similar services put credentials in that URL, so never log it.
+            tracing::warn!("failed to deliver approval notification");
         }
     }
 }

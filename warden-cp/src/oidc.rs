@@ -5,6 +5,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
+use futures_util::StreamExt;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ pub struct OidcConfig {
     pub allowed_domains: Vec<String>,
     pub default_roles: Vec<String>,
     pub session_ttl_hours: i64,
+    http: reqwest::Client,
 }
 
 impl OidcConfig {
@@ -40,11 +42,26 @@ impl OidcConfig {
             .unwrap_or_else(|_| "http://127.0.0.1:7878/oidc/callback".to_string());
         let allowed_domains = csv_env("OIDC_ALLOWED_EMAIL_DOMAINS");
         let default_roles = csv_env("OIDC_DEFAULT_ROLES");
-        let session_ttl_hours = std::env::var("OIDC_SESSION_TTL_HOURS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-            .clamp(1, 24);
+        let session_ttl_hours = match std::env::var("OIDC_SESSION_TTL_HOURS") {
+            Ok(value) => value
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("OIDC_SESSION_TTL_HOURS must be an integer"))?,
+            Err(std::env::VarError::NotPresent) => 8,
+            Err(e) => return Err(e.into()),
+        };
+        if !(1..=24).contains(&session_ttl_hours) {
+            anyhow::bail!("OIDC_SESSION_TTL_HOURS must be between 1 and 24");
+        }
+        validate_endpoint("OIDC issuer", &issuer_url)?;
+        validate_endpoint("OIDC redirect", &redirect_url)?;
+        if allowed_domains.is_empty() {
+            anyhow::bail!("OIDC_ALLOWED_EMAIL_DOMAINS must contain at least one allowed domain");
+        }
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()?;
 
         Ok(Some(Self {
             issuer_url,
@@ -54,6 +71,7 @@ impl OidcConfig {
             allowed_domains,
             default_roles,
             session_ttl_hours,
+            http,
         }))
     }
 }
@@ -123,6 +141,14 @@ pub async fn login(
     let code_challenge = pkce_challenge(&code_verifier);
     let now = Utc::now();
     let expires = now + Duration::minutes(10);
+
+    // Login state is short-lived and single-use. Opportunistic cleanup keeps
+    // abandoned login attempts from growing the table without bound.
+    sqlx::query("DELETE FROM oidc_login_states WHERE expires_at <= $1")
+        .bind(now.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .map_err(err500)?;
 
     sqlx::query(
         "INSERT INTO oidc_login_states
@@ -217,19 +243,25 @@ fn oidc(state: &AppState) -> ApiResult<std::sync::Arc<OidcConfig>> {
 
 async fn discover(cfg: &OidcConfig) -> ApiResult<Discovery> {
     let url = format!("{}/.well-known/openid-configuration", cfg.issuer_url);
-    let discovery: Discovery = reqwest::Client::new()
+    let response = cfg
+        .http
         .get(url)
         .send()
         .await
         .map_err(bad_gateway)?
         .error_for_status()
-        .map_err(bad_gateway)?
-        .json()
-        .await
         .map_err(bad_gateway)?;
+    let discovery: Discovery = response_json_limited(response, 2 * 1024 * 1024).await?;
     if trim_slash(&discovery.issuer) != cfg.issuer_url {
         return Err((StatusCode::BAD_GATEWAY, "OIDC issuer mismatch".into()));
     }
+    validate_endpoint(
+        "OIDC authorization endpoint",
+        &discovery.authorization_endpoint,
+    )
+    .map_err(bad_gateway)?;
+    validate_endpoint("OIDC token endpoint", &discovery.token_endpoint).map_err(bad_gateway)?;
+    validate_endpoint("OIDC JWKS endpoint", &discovery.jwks_uri).map_err(bad_gateway)?;
     Ok(discovery)
 }
 
@@ -247,17 +279,16 @@ async fn exchange_code(
         ("client_secret", cfg.client_secret.as_str()),
         ("code_verifier", code_verifier),
     ];
-    reqwest::Client::new()
+    let response = cfg
+        .http
         .post(&discovery.token_endpoint)
         .form(&params)
         .send()
         .await
         .map_err(bad_gateway)?
         .error_for_status()
-        .map_err(bad_gateway)?
-        .json()
-        .await
-        .map_err(bad_gateway)
+        .map_err(bad_gateway)?;
+    response_json_limited(response, 1024 * 1024).await
 }
 
 async fn verify_id_token(
@@ -266,12 +297,7 @@ async fn verify_id_token(
     id_token: &str,
     nonce: &str,
 ) -> ApiResult<Claims> {
-    let header = decode_header(id_token).map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            format!("bad ID token header: {e}"),
-        )
-    })?;
+    let header = decode_header(id_token).map_err(|e| oidc_token_rejected("header", e))?;
     let alg = header.alg;
     if !matches!(alg, Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512) {
         return Err((
@@ -279,16 +305,15 @@ async fn verify_id_token(
             "only RSA-signed OIDC ID tokens are supported".into(),
         ));
     }
-    let jwks: Jwks = reqwest::Client::new()
+    let response = cfg
+        .http
         .get(&discovery.jwks_uri)
         .send()
         .await
         .map_err(bad_gateway)?
         .error_for_status()
-        .map_err(bad_gateway)?
-        .json()
-        .await
         .map_err(bad_gateway)?;
+    let jwks: Jwks = response_json_limited(response, 2 * 1024 * 1024).await?;
     let jwk = jwks
         .keys
         .iter()
@@ -311,17 +336,13 @@ async fn verify_id_token(
         .as_deref()
         .ok_or((StatusCode::UNAUTHORIZED, "JWK missing e".into()))?;
     let key = DecodingKey::from_rsa_components(n, e)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("bad RSA JWK: {e}")))?;
+        .map_err(|error| oidc_token_rejected("JWK", error))?;
 
     let mut validation = Validation::new(alg);
     validation.set_audience(std::slice::from_ref(&cfg.client_id));
     validation.set_issuer(std::slice::from_ref(&discovery.issuer));
-    let data = decode::<Claims>(id_token, &key, &validation).map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            format!("ID token verification failed: {e}"),
-        )
-    })?;
+    let data = decode::<Claims>(id_token, &key, &validation)
+        .map_err(|e| oidc_token_rejected("claims", e))?;
     if data.claims.nonce.as_deref() != Some(nonce) {
         return Err((StatusCode::UNAUTHORIZED, "OIDC nonce mismatch".into()));
     }
@@ -602,6 +623,51 @@ fn trim_slash(value: &str) -> String {
     value.trim_end_matches('/').to_string()
 }
 
+fn validate_endpoint(label: &str, value: &str) -> anyhow::Result<()> {
+    let url = Url::parse(value).map_err(|e| anyhow::anyhow!("invalid {label}: {e}"))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        anyhow::bail!("{label} must use HTTPS (HTTP is allowed only for loopback development)");
+    }
+    if url.username() != "" || url.password().is_some() {
+        anyhow::bail!("{label} must not contain embedded credentials");
+    }
+    Ok(())
+}
+
+async fn response_json_limited<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> ApiResult<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "upstream identity provider response is too large".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(bad_gateway)?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "upstream identity provider response is too large".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(bad_gateway)
+}
+
 fn alg_name(alg: Algorithm) -> &'static str {
     match alg {
         Algorithm::RS256 => "RS256",
@@ -621,9 +687,22 @@ fn escape_html(value: &str) -> String {
 }
 
 fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "internal OIDC operation failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+    )
 }
 
 fn bad_gateway(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::BAD_GATEWAY, e.to_string())
+    tracing::warn!(error = %e, "upstream OIDC provider operation failed");
+    (
+        StatusCode::BAD_GATEWAY,
+        "upstream identity provider error".to_string(),
+    )
+}
+
+fn oidc_token_rejected(stage: &'static str, error: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::warn!(%stage, %error, "OIDC token rejected");
+    (StatusCode::UNAUTHORIZED, "OIDC token rejected".to_string())
 }

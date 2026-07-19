@@ -1,15 +1,39 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    # Preserve PostgreSQL 17 storage compatibility while rebuilding its gosu
+    # helper with a patched Go runtime; both base images are digest-pinned.
+    image: warden-cp-postgres:17.10-hardened
+    build:
+      context: ../../..
+      dockerfile: warden-cp/deploy/postgres/Dockerfile
     restart: unless-stopped
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The official entrypoint starts as root only to prepare the data volume,
+    # then drops to postgres. Keep exactly the capabilities that transition
+    # requires instead of Docker's broader default set.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 256
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-warden_cp}
       POSTGRES_USER: ${POSTGRES_USER:-warden_cp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-    ports:
-      - "127.0.0.1:5432:5432"
     volumes:
       - warden_cp_pgdata:/var/lib/postgresql/data
+    tmpfs:
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0775
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    networks:
+      - database
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-warden_cp} -d ${POSTGRES_DB:-warden_cp}"]
       interval: 10s
@@ -18,14 +42,26 @@ services:
 
   warden-cp:
     build:
-      context: ../..
+      context: ../../..
+      dockerfile: warden-cp/Dockerfile
     restart: unless-stopped
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-warden_cp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-warden_cp}
       BIND_ADDR: 0.0.0.0:7878
+      # Docker port publishing requires a non-loopback bind inside the
+      # container. The checked-in env example opts into this only while the
+      # published host address remains 127.0.0.1.
+      WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK: ${WARDEN_CP_ALLOW_INSECURE_NON_LOOPBACK:?set true only for the localhost-bound development deployment, otherwise configure TLS}
       TRUST_DOMAIN: ${TRUST_DOMAIN:-warden.local}
       SIGNING_KEY_PATH: ${SIGNING_KEY_PATH:-/var/lib/warden-cp/warden-cp-signing.key}
       ML_DSA_SIGNING_KEY_PATH: ${ML_DSA_SIGNING_KEY_PATH:-/var/lib/warden-cp/warden-cp-ml-dsa65.key}
@@ -34,7 +70,17 @@ services:
       - "${WARDEN_CP_BIND:-127.0.0.1:7878}:7878"
     volumes:
       - warden_cp_state:/var/lib/warden-cp
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    networks:
+      - database
+      - ingress
 
 volumes:
   warden_cp_pgdata:
   warden_cp_state:
+
+networks:
+  database:
+    internal: true
+  ingress:

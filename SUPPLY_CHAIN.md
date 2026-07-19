@@ -2,9 +2,11 @@
 
 This repository uses GitHub Actions for three supply-chain controls:
 
-- `.github/workflows/security.yml` runs `cargo check`, `cargo test`,
-  `cargo audit`, and `cargo deny check advisories` for both `warden-cp` and
-  `mcp-warden`.
+- `.github/workflows/security.yml` runs warning-denying Clippy, tests,
+  `cargo audit`, the full Cargo Deny advisory/license/ban/source policy, and a
+  fail-on-any-finding Trivy vulnerability/secret scans of both production
+  container images for `warden-cp` and its pinned PostgreSQL 17 deployment,
+  including the production Postgres feature graph on Linux and Windows.
 - `.github/workflows/release-provenance.yml` builds the `warden-cp` Postgres
   Docker image, pushes it to GHCR, signs the image digest with Sigstore/cosign
   keyless signing through GitHub OIDC, and publishes GitHub artifact
@@ -69,5 +71,6 @@ review dependency changes before release.
 - Do not bypass the release workflow for images you ship to admins or agents.
 - Do not store private signing keys in the repo for provenance; use keyless
   Sigstore/GitHub OIDC.
-- Keep `cargo audit` and `cargo deny` clean before publishing a release.
+- Keep `cargo audit`, `cargo deny`, and the production-image Trivy scan clean
+  before publishing a release.
 - Verify provenance during deployment, not only during incident response.

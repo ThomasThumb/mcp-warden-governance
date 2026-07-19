@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::Html,
     Json,
 };
@@ -9,7 +9,7 @@ use chrono::{Duration, Utc};
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
@@ -77,7 +77,10 @@ pub async fn rate_limit(
     {
         let now = Instant::now();
         let cutoff = StdDuration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        let mut limits = state.rate_limits.lock().unwrap();
+        let mut limits = state
+            .rate_limits
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let hits = limits
             .entry(principal.0.clone())
             .or_insert_with(VecDeque::new);
@@ -104,6 +107,43 @@ pub async fn require_https(
         return Ok(next.run(req).await);
     }
     Err(StatusCode::UPGRADE_REQUIRED)
+}
+
+pub async fn security_headers(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let secure = request_is_secure(&state, req.headers());
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    if secure {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
 }
 
 fn request_is_secure(state: &AppState, headers: &HeaderMap) -> bool {
@@ -150,11 +190,59 @@ pub async fn admin_dashboard() -> Html<&'static str> {
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
 fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    tracing::error!(error = %e, "internal API operation failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+    )
 }
 
 fn forbidden(msg: impl Into<String>) -> (StatusCode, String) {
     (StatusCode::FORBIDDEN, msg.into())
+}
+
+fn bad_request(msg: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, msg.into())
+}
+
+fn validate_identifier(label: &str, value: &str) -> ApiResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(bad_request(format!(
+            "{label} must be 1-128 ASCII letters, digits, '.', '_' or '-'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text(label: &str, value: &str, max_len: usize) -> ApiResult<()> {
+    if value.trim().is_empty()
+        || value.len() > max_len
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(bad_request(format!(
+            "{label} must be 1-{max_len} non-control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, value: &str) -> ApiResult<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(bad_request(format!(
+            "{label} must be a 64-character hexadecimal SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn audit_verification_error(e: impl std::fmt::Display) -> &'static str {
+    tracing::error!(error = %e, "audit verification encountered malformed or unavailable internal data");
+    "details recorded in server logs"
 }
 
 async fn gateway_owner(state: &AppState, gateway_id: &str) -> ApiResult<Option<String>> {
@@ -253,19 +341,7 @@ pub async fn principal_has_role(
 }
 
 async fn is_root_admin(state: &AppState, principal: &AuthedPrincipal) -> ApiResult<bool> {
-    if principal_has_role(state, principal, "root_admin").await? {
-        return Ok(true);
-    }
-
-    // Backwards-compatible fallback for pre-role SQLite files.
-    let row = sqlx::query("SELECT display_name FROM principals WHERE id = $1")
-        .bind(&principal.0)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(err500)?;
-    Ok(row
-        .and_then(|r| r.try_get::<String, _>("display_name").ok())
-        .is_some_and(|name| name == "root-admin"))
+    principal_has_role(state, principal, "root_admin").await
 }
 
 async fn ensure_root_admin(state: &AppState, principal: &AuthedPrincipal) -> ApiResult<()> {
@@ -304,11 +380,9 @@ pub async fn create_principal(
         ));
     }
     let display_name = req.display_name.trim();
-    if display_name.is_empty() || display_name.len() > 128 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "display_name must be 1-128 characters".into(),
-        ));
+    validate_text("display_name", display_name, 128)?;
+    if let Some(external_id) = &req.external_id {
+        validate_text("external_id", external_id, 512)?;
     }
 
     let id = Uuid::new_v4().to_string();
@@ -497,10 +571,12 @@ pub async fn list_groups(
         out.push(GroupView {
             id: group_id,
             display_name: row.try_get("display_name").map_err(err500)?,
-            external_id: row.try_get("external_id").ok(),
-            active: row.try_get::<i64, _>("active").unwrap_or(1) != 0,
+            external_id: row
+                .try_get::<Option<String>, _>("external_id")
+                .map_err(err500)?,
+            active: row.try_get::<i64, _>("active").map_err(err500)? != 0,
             roles,
-            member_count: row.try_get("member_count").unwrap_or(0),
+            member_count: row.try_get("member_count").map_err(err500)?,
             created_at: row.try_get("created_at").map_err(err500)?,
         });
     }
@@ -537,8 +613,8 @@ fn row_to_principal(r: &DbRow) -> anyhow::Result<Principal> {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,
         display_name: r.try_get("display_name")?,
-        external_id: r.try_get("external_id").ok(),
-        active: r.try_get::<i64, _>("active").unwrap_or(1) != 0,
+        external_id: r.try_get("external_id")?,
+        active: r.try_get::<i64, _>("active")? != 0,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -548,11 +624,11 @@ fn row_to_session(r: &DbRow) -> anyhow::Result<AgentSession> {
         id: r.try_get("id")?,
         spiffe_id: r.try_get("spiffe_id")?,
         principal_id: r.try_get("principal_id")?,
-        purpose: r.try_get("purpose").ok(),
+        purpose: r.try_get("purpose")?,
         public_key_b64: r.try_get("public_key_b64")?,
         issued_at: r.try_get("issued_at")?,
         expires_at: r.try_get("expires_at")?,
-        revoked_at: r.try_get("revoked_at").ok(),
+        revoked_at: r.try_get("revoked_at")?,
     })
 }
 
@@ -648,7 +724,7 @@ pub async fn admin_summary(
     }))
 }
 
-async fn count(state: &AppState, sql: &str) -> ApiResult<i64> {
+async fn count(state: &AppState, sql: &'static str) -> ApiResult<i64> {
     let row = sqlx::query(sql)
         .fetch_one(&state.pool)
         .await
@@ -656,7 +732,7 @@ async fn count(state: &AppState, sql: &str) -> ApiResult<i64> {
     row.try_get("c").map_err(err500)
 }
 
-async fn count_bound(state: &AppState, sql: &str, value: &str) -> ApiResult<i64> {
+async fn count_bound(state: &AppState, sql: &'static str, value: &str) -> ApiResult<i64> {
     let row = sqlx::query(sql)
         .bind(value)
         .fetch_one(&state.pool)
@@ -665,11 +741,16 @@ async fn count_bound(state: &AppState, sql: &str, value: &str) -> ApiResult<i64>
     row.try_get("c").map_err(err500)
 }
 
-async fn count_owned(state: &AppState, sql: &str, owner: &str) -> ApiResult<i64> {
+async fn count_owned(state: &AppState, sql: &'static str, owner: &str) -> ApiResult<i64> {
     count_bound(state, sql, owner).await
 }
 
-async fn count_two_bound(state: &AppState, sql: &str, first: &str, second: &str) -> ApiResult<i64> {
+async fn count_two_bound(
+    state: &AppState,
+    sql: &'static str,
+    first: &str,
+    second: &str,
+) -> ApiResult<i64> {
     let row = sqlx::query(sql)
         .bind(first)
         .bind(second)
@@ -961,21 +1042,21 @@ fn row_to_audit_event(r: &DbRow) -> anyhow::Result<AuditEventView> {
     let flags: String = r.try_get("injection_flags")?;
     Ok(AuditEventView {
         id: r.try_get("id")?,
-        seq: r.try_get("seq").ok(),
-        canonical_version: r.try_get("canonical_version").ok(),
+        seq: r.try_get("seq")?,
+        canonical_version: r.try_get("canonical_version")?,
         ts: r.try_get("ts")?,
         gateway_id: r.try_get("gateway_id")?,
-        agent_session_id: r.try_get("agent_session_id").ok(),
-        principal_id: r.try_get("principal_id").ok(),
+        agent_session_id: r.try_get("agent_session_id")?,
+        principal_id: r.try_get("principal_id")?,
         server_id: r.try_get("server_id")?,
         tool_name: r.try_get("tool_name")?,
         decision: r.try_get("decision")?,
         args_fingerprint: r.try_get("args_fingerprint")?,
-        injection_flags: serde_json::from_str(&flags).unwrap_or_default(),
-        result_bytes: r.try_get("result_bytes").ok(),
+        injection_flags: serde_json::from_str(&flags)?,
+        result_bytes: r.try_get("result_bytes")?,
         prev_hash: r.try_get("prev_hash")?,
         entry_hash: r.try_get("entry_hash")?,
-        checkpoint_signed_at: r.try_get("checkpoint_signed_at").ok(),
+        checkpoint_signed_at: r.try_get("checkpoint_signed_at")?,
     })
 }
 
@@ -984,6 +1065,25 @@ pub async fn register_gateway(
     principal: AuthedPrincipal,
     Json(req): Json<RegisterGatewayRequest>,
 ) -> ApiResult<StatusCode> {
+    validate_identifier("gateway_id", &req.gateway_id)?;
+    validate_text("hostname", &req.hostname, 255)?;
+    validate_text("version", &req.version, 64)?;
+    if req.upstreams.len() > 256 {
+        return Err(bad_request("a gateway may report at most 256 upstreams"));
+    }
+    let mut server_ids = HashSet::with_capacity(req.upstreams.len());
+    for upstream in &req.upstreams {
+        validate_identifier("upstream server_id", &upstream.server_id)?;
+        if !server_ids.insert(&upstream.server_id) {
+            return Err(bad_request(format!(
+                "duplicate upstream server_id '{}'",
+                upstream.server_id
+            )));
+        }
+        if !matches!(upstream.transport.as_str(), "stdio" | "http") {
+            return Err(bad_request("upstream transport must be stdio or http"));
+        }
+    }
     if req.owner_principal_id != principal.0 {
         return Err(forbidden(
             "gateway owner_principal_id must match the authenticated principal",
@@ -996,36 +1096,49 @@ pub async fn register_gateway(
     }
 
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    let mut transaction = state.pool.begin().await.map_err(err500)?;
+    let gateway_result = sqlx::query(
         "INSERT INTO gateways (id, owner_principal_id, hostname, version, last_heartbeat_at)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT(id) DO UPDATE SET last_heartbeat_at = excluded.last_heartbeat_at,
-             version = excluded.version, hostname = excluded.hostname",
+             version = excluded.version, hostname = excluded.hostname
+         WHERE gateways.owner_principal_id = excluded.owner_principal_id",
     )
     .bind(&req.gateway_id)
     .bind(&principal.0)
     .bind(&req.hostname)
     .bind(&req.version)
     .bind(&now)
-    .execute(&state.pool)
+    .execute(&mut *transaction)
     .await
     .map_err(err500)?;
+    if gateway_result.rows_affected() != 1 {
+        return Err(forbidden("gateway is already owned by another principal"));
+    }
+
+    // Registration is an authoritative inventory snapshot. Delete stale rows
+    // and rebuild atomically so partial reports are never visible.
+    sqlx::query("DELETE FROM upstream_inventory WHERE gateway_id = $1")
+        .bind(&req.gateway_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(err500)?;
 
     for up in &req.upstreams {
         sqlx::query(
             "INSERT INTO upstream_inventory (gateway_id, server_id, transport, reported_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(gateway_id, server_id) DO UPDATE SET
-                 transport = excluded.transport, reported_at = excluded.reported_at",
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(&req.gateway_id)
         .bind(&up.server_id)
         .bind(&up.transport)
         .bind(&now)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(err500)?;
     }
+
+    transaction.commit().await.map_err(err500)?;
 
     Ok(StatusCode::OK)
 }
@@ -1071,6 +1184,7 @@ pub async fn put_policy(
     principal: AuthedPrincipal,
     Json(req): Json<PolicyBundle>,
 ) -> ApiResult<Json<PolicyBundle>> {
+    validate_identifier("policy scope", &req.scope)?;
     ensure_scope_owner(&state, &principal, &req.scope).await?;
 
     let next_version_row =
@@ -1079,11 +1193,17 @@ pub async fn put_policy(
             .fetch_one(&state.pool)
             .await
             .map_err(err500)?;
-    let next_version: i64 = next_version_row.try_get::<i64, _>("v").unwrap_or(0) + 1;
+    let next_version: i64 = next_version_row.try_get::<i64, _>("v").map_err(err500)? + 1;
 
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let bundle_text = serde_json::to_string(&req.bundle).map_err(err500)?;
+    if bundle_text.len() > 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "policy bundle exceeds the 1 MiB size limit".into(),
+        ));
+    }
 
     sqlx::query(
         "INSERT INTO policy_bundles (id, scope, version, bundle_json, created_at, created_by)
@@ -1115,6 +1235,10 @@ pub async fn report_tool_fingerprint(
     principal: AuthedPrincipal,
     Json(req): Json<ToolFingerprintReport>,
 ) -> ApiResult<Json<ToolFingerprintDecision>> {
+    validate_identifier("gateway_id", &req.gateway_id)?;
+    validate_identifier("server_id", &req.server_id)?;
+    validate_text("tool_name", &req.tool_name, 256)?;
+    validate_sha256("fingerprint", &req.fingerprint)?;
     ensure_gateway_owner(&state, &principal, &req.gateway_id).await?;
 
     let now = Utc::now().to_rfc3339();
@@ -1178,6 +1302,9 @@ pub async fn approve_tool_fingerprint(
     principal: AuthedPrincipal,
     Json(req): Json<ApproveFingerprintRequest>,
 ) -> ApiResult<StatusCode> {
+    validate_identifier("gateway_id", &req.gateway_id)?;
+    validate_identifier("server_id", &req.server_id)?;
+    validate_text("tool_name", &req.tool_name, 256)?;
     ensure_gateway_owner(&state, &principal, &req.gateway_id).await?;
 
     let result = sqlx::query(
@@ -1205,19 +1332,31 @@ pub async fn create_approval(
     principal: AuthedPrincipal,
     Json(req): Json<CreateApprovalRequest>,
 ) -> ApiResult<Json<ApprovalRequest>> {
+    validate_identifier("gateway_id", &req.gateway_id)?;
+    validate_identifier("server_id", &req.server_id)?;
+    validate_text("tool_name", &req.tool_name, 256)?;
+    validate_sha256("args_fingerprint", &req.args_fingerprint)?;
+    if req.risk_tier != "require_approval" {
+        return Err(bad_request("risk_tier must be require_approval"));
+    }
     ensure_gateway_owner(&state, &principal, &req.gateway_id).await?;
     if let Some(session_id) = &req.agent_session_id {
         ensure_session_owner(&state, &principal, session_id).await?;
     }
 
+    if let Some(existing) = find_open_approval(&state, &req).await? {
+        return Ok(Json(existing));
+    }
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO approval_requests
              (id, gateway_id, agent_session_id, server_id, tool_name, args_fingerprint,
               risk_tier, status, requested_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+         ON CONFLICT DO NOTHING",
     )
     .bind(&id)
     .bind(&req.gateway_id)
@@ -1230,6 +1369,13 @@ pub async fn create_approval(
     .execute(&state.pool)
     .await
     .map_err(err500)?;
+
+    if inserted.rows_affected() == 0 {
+        return find_open_approval(&state, &req).await?.map(Json).ok_or((
+            StatusCode::CONFLICT,
+            "approval state changed concurrently; retry the request".into(),
+        ));
+    }
 
     let approval = ApprovalRequest {
         id,
@@ -1244,19 +1390,59 @@ pub async fn create_approval(
         decided_at: None,
         decided_by: None,
         reason: None,
+        used_at: None,
     };
 
     state.notifier.notify_pending(&approval).await;
     Ok(Json(approval))
 }
 
+async fn find_open_approval(
+    state: &AppState,
+    req: &CreateApprovalRequest,
+) -> ApiResult<Option<ApprovalRequest>> {
+    let row = sqlx::query(
+        "SELECT * FROM approval_requests
+         WHERE gateway_id = $1
+           AND (agent_session_id = $2 OR (agent_session_id IS NULL AND $2 IS NULL))
+           AND server_id = $3 AND tool_name = $4 AND args_fingerprint = $5
+           AND risk_tier = $6 AND status IN ('pending', 'approved')
+         ORDER BY requested_at DESC LIMIT 1",
+    )
+    .bind(&req.gateway_id)
+    .bind(&req.agent_session_id)
+    .bind(&req.server_id)
+    .bind(&req.tool_name)
+    .bind(&req.args_fingerprint)
+    .bind(&req.risk_tier)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(err500)?;
+    row.map(|row| row_to_approval(&row).map_err(err500))
+        .transpose()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalListQuery {
+    status: Option<String>,
+}
+
 pub async fn list_approvals(
     State(state): State<AppState>,
     principal: AuthedPrincipal,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<ApprovalListQuery>,
 ) -> ApiResult<Json<Vec<ApprovalRequest>>> {
-    let status_filter = params.get("status").cloned();
-    let rows = if let Some(status) = status_filter {
+    if params
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "pending" | "approved" | "denied" | "consumed"))
+    {
+        return Err(bad_request(
+            "status must be pending, approved, denied or consumed",
+        ));
+    }
+    let rows = if let Some(status) = params.status {
         sqlx::query(
             "SELECT ar.* FROM approval_requests ar
              JOIN gateways g ON g.id = ar.gateway_id
@@ -1301,6 +1487,15 @@ pub async fn decide_approval(
     principal: AuthedPrincipal,
     Json(req): Json<DecideApprovalRequest>,
 ) -> ApiResult<Json<ApprovalRequest>> {
+    if req
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > 2048)
+    {
+        return Err(bad_request(
+            "approval reason must not exceed 2048 characters",
+        ));
+    }
     let now = Utc::now().to_rfc3339();
     let status = if req.approved { "approved" } else { "denied" };
 
@@ -1337,6 +1532,33 @@ pub async fn decide_approval(
     fetch_approval_for_principal(&state, &principal, &id).await
 }
 
+pub async fn consume_approval(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    principal: AuthedPrincipal,
+) -> ApiResult<Json<ApprovalRequest>> {
+    let now = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE approval_requests
+         SET status = 'consumed', used_at = $1
+         WHERE id = $2 AND status = 'approved'
+           AND gateway_id IN (SELECT id FROM gateways WHERE owner_principal_id = $3)",
+    )
+    .bind(&now)
+    .bind(&id)
+    .bind(&principal.0)
+    .execute(&state.pool)
+    .await
+    .map_err(err500)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("approval '{id}' is not approved or was already consumed"),
+        ));
+    }
+    fetch_approval_for_principal(&state, &principal, &id).await
+}
+
 async fn fetch_approval_for_principal(
     state: &AppState,
     principal: &AuthedPrincipal,
@@ -1362,21 +1584,27 @@ fn row_to_approval(r: &DbRow) -> anyhow::Result<ApprovalRequest> {
     Ok(ApprovalRequest {
         id: r.try_get("id")?,
         gateway_id: r.try_get("gateway_id")?,
-        agent_session_id: r.try_get("agent_session_id").ok(),
+        agent_session_id: r.try_get("agent_session_id")?,
         server_id: r.try_get("server_id")?,
         tool_name: r.try_get("tool_name")?,
         args_fingerprint: r.try_get("args_fingerprint")?,
         risk_tier: r.try_get("risk_tier")?,
         status: r.try_get("status")?,
         requested_at: r.try_get("requested_at")?,
-        decided_at: r.try_get("decided_at").ok(),
-        decided_by: r.try_get("decided_by").ok(),
-        reason: r.try_get("reason").ok(),
+        decided_at: r.try_get("decided_at")?,
+        decided_by: r.try_get("decided_by")?,
+        reason: r.try_get("reason")?,
+        used_at: r.try_get("used_at")?,
     })
 }
 
 fn token_audience(gateway_id: &str, server_id: &str, tool_name: &str) -> String {
-    format!("warden-mcp:{gateway_id}:{server_id}:{tool_name}")
+    format!(
+        "warden-mcp:v2:{}:{gateway_id}:{}:{server_id}:{}:{tool_name}",
+        gateway_id.len(),
+        server_id.len(),
+        tool_name.len()
+    )
 }
 
 fn agent_session_id_from_spiffe(spiffe_id: &str) -> Option<String> {
@@ -1534,6 +1762,35 @@ pub async fn ingest_audit(
         ));
     }
     for event in &events {
+        validate_identifier("gateway_id", &event.gateway_id)?;
+        validate_identifier("server_id", &event.server_id)?;
+        validate_text("tool_name", &event.tool_name, 256)?;
+        validate_sha256("args_fingerprint", &event.args_fingerprint)?;
+        if !matches!(
+            event.decision.as_str(),
+            "authorized"
+                | "allowed"
+                | "allowed_flagged"
+                | "denied"
+                | "pending_approval"
+                | "blocked_injection"
+                | "blocked_rug_pull"
+        ) {
+            return Err(bad_request("audit decision is not recognized"));
+        }
+        if event.injection_flags.len() > 32
+            || event
+                .injection_flags
+                .iter()
+                .any(|flag| validate_text("injection flag", flag, 128).is_err())
+        {
+            return Err(bad_request(
+                "audit injection flags are invalid or exceed 32 entries",
+            ));
+        }
+        if event.result_bytes.is_some_and(|bytes| bytes < 0) {
+            return Err(bad_request("result_bytes must be non-negative"));
+        }
         ensure_gateway_owner(&state, &principal, &event.gateway_id).await?;
         if let Some(session_id) = &event.agent_session_id {
             ensure_session_owner(&state, &principal, session_id).await?;
@@ -1555,6 +1812,8 @@ pub async fn ingest_audit(
     let mut tail_guard = state.audit_chain_tail.lock().await;
     let mut tail = tail_guard.clone();
 
+    let mut transaction = state.pool.begin().await.map_err(err500)?;
+    let mut final_anchor = None;
     for e in events {
         let now = Utc::now().to_rfc3339();
         let flags_json = serde_json::to_string(&e.injection_flags).map_err(err500)?;
@@ -1576,15 +1835,17 @@ pub async fn ingest_audit(
             result_bytes: e.result_bytes,
         });
         let checkpoint_signed_at = now.clone();
-        let checkpoint = state
-            .signer
-            .sign_audit_checkpoint(
-                seq,
-                &entry_hash,
-                &checkpoint_signed_at,
-                audit_requires_ml_dsa_checkpoint(seq, state.audit_ml_dsa_checkpoint_interval),
-            )
-            .map_err(err500)?;
+        let signer = Arc::clone(&state.signer);
+        let checkpoint_hash = entry_hash.clone();
+        let checkpoint_time = checkpoint_signed_at.clone();
+        let include_ml_dsa =
+            audit_requires_ml_dsa_checkpoint(seq, state.audit_ml_dsa_checkpoint_interval);
+        let checkpoint = tokio::task::spawn_blocking(move || {
+            signer.sign_audit_checkpoint(seq, &checkpoint_hash, &checkpoint_time, include_ml_dsa)
+        })
+        .await
+        .map_err(err500)?
+        .map_err(err500)?;
         let anchor_record = AuditAnchorRecord::new(
             seq,
             entry_hash.clone(),
@@ -1619,7 +1880,7 @@ pub async fn ingest_audit(
         .bind(&checkpoint.ed25519_sig_b64)
         .bind(&checkpoint.ml_dsa_alg)
         .bind(&checkpoint.ml_dsa_sig_b64)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(err500)?;
 
@@ -1627,21 +1888,25 @@ pub async fn ingest_audit(
             seq,
             hash: entry_hash,
         };
-        if let Err(e) = state.audit_anchor.publish(&anchor_record) {
-            *tail_guard = tail.clone();
+        final_anchor = Some(anchor_record);
+    }
+
+    if let Some(anchor_record) = final_anchor {
+        let seq = anchor_record.seq;
+        if let Err(e) = state.audit_anchor.publish(anchor_record).await {
             if state.audit_anchor.required() {
                 return Err(err500(format!(
-                    "required audit anchor publish failed after seq {seq}: {e}"
+                    "required audit anchor publish failed before committing seq {seq}: {e}"
                 )));
             }
             tracing::warn!(
                 seq,
                 error = %e,
-                "audit anchor publish failed; database row is still signed but rollback detection may lag"
+                "audit anchor publish failed; rows will commit signed but rollback detection may lag"
             );
         }
     }
-
+    transaction.commit().await.map_err(err500)?;
     *tail_guard = tail;
     Ok(StatusCode::OK)
 }
@@ -1651,13 +1916,13 @@ pub async fn ingest_audit(
 /// This is the entire point of hash-chaining - if you never call this, the
 /// chain is just extra columns.
 pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let latest_anchor = match state.audit_anchor.latest() {
+    let latest_anchor = match state.audit_anchor.latest().await {
         Ok(anchor) => anchor,
         Err(e) if state.audit_anchor.required() => {
             return Json(serde_json::json!({
                 "ok": false,
                 "reason": "failed to read required audit anchor",
-                "error": e.to_string()
+                "error": audit_verification_error(e)
             }))
         }
         Err(e) => {
@@ -1683,7 +1948,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             return Json(serde_json::json!({
                 "ok": false,
                 "reason": "latest audit anchor signature does not verify",
-                "error": e.to_string()
+                "error": audit_verification_error(e)
             }));
         }
     }
@@ -1711,7 +1976,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             return Json(serde_json::json!({
                 "ok": false,
                 "reason": "failed to stream audit rows",
-                "error": e.to_string()
+                "error": audit_verification_error(e)
             }))
         }
     } {
@@ -1721,7 +1986,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "audit row has an invalid id column",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -1730,7 +1995,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 "ok": false,
                 "broken_at_id": id,
                 "reason": format!("audit row has an invalid {column} column"),
-                "error": error.to_string()
+                "error": audit_verification_error(error)
             }))
         };
         let seq: Option<i64> = match r.try_get("seq") {
@@ -1923,7 +2188,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                     "ok": false,
                     "broken_at_id": id,
                     "reason": "audit checkpoint signature does not verify",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }));
             }
             if let Some(anchor) = &latest_anchor {
@@ -1960,7 +2225,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "failed to read legacy audit seal",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -1976,7 +2241,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "legacy audit seal has invalid last_entry_hash",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -1992,7 +2257,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "legacy audit seal has invalid sealed_at",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -2002,7 +2267,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "legacy audit seal has invalid seal_sig_b64",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -2012,7 +2277,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "legacy audit seal has invalid seal_ml_dsa_alg",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -2022,7 +2287,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
                 return Json(serde_json::json!({
                     "ok": false,
                     "reason": "legacy audit seal has invalid seal_ml_dsa_sig_b64",
-                    "error": e.to_string()
+                    "error": audit_verification_error(e)
                 }))
             }
         };
@@ -2039,7 +2304,7 @@ pub async fn verify_audit_chain(State(state): State<AppState>) -> Json<serde_jso
             return Json(serde_json::json!({
                 "ok": false,
                 "reason": "legacy audit seal signature does not verify",
-                "error": e.to_string()
+                "error": audit_verification_error(e)
             }));
         }
         true
@@ -2107,6 +2372,16 @@ pub async fn mint_agent_session(
             "agent session principal_id must match the authenticated principal",
         ));
     }
+    if !(1..=24 * 60).contains(&req.ttl_minutes) {
+        return Err(bad_request("ttl_minutes must be between 1 and 1440"));
+    }
+    if req
+        .purpose
+        .as_ref()
+        .is_some_and(|purpose| purpose.len() > 512)
+    {
+        return Err(bad_request("purpose must not exceed 512 characters"));
+    }
     let public_key = BASE64_STANDARD.decode(&req.public_key_b64).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -2123,8 +2398,7 @@ pub async fn mint_agent_session(
     let id = Uuid::new_v4().to_string();
     let spiffe_id = mint_spiffe_id(&state.trust_domain, &id);
     let now = Utc::now();
-    let ttl_minutes = req.ttl_minutes.clamp(1, 24 * 60);
-    let expires = now + Duration::minutes(ttl_minutes);
+    let expires = now + Duration::minutes(req.ttl_minutes);
 
     sqlx::query(
         "INSERT INTO agent_sessions
@@ -2159,6 +2433,12 @@ pub async fn issue_token(
     principal: AuthedPrincipal,
     Json(req): Json<IssueTokenRequest>,
 ) -> ApiResult<Json<IssuedToken>> {
+    validate_identifier("gateway_id", &req.gateway_id)?;
+    validate_identifier("server_id", &req.server_id)?;
+    validate_text("tool_name", &req.tool_name, 256)?;
+    if !(30..=3600).contains(&req.ttl_seconds) {
+        return Err(bad_request("ttl_seconds must be between 30 and 3600"));
+    }
     ensure_gateway_owner(&state, &principal, &req.gateway_id).await?;
 
     let row = sqlx::query(
@@ -2173,7 +2453,7 @@ pub async fn issue_token(
     let Some(row) = row else {
         return Err((StatusCode::NOT_FOUND, "unknown agent_session_id".into()));
     };
-    let revoked_at: Option<String> = row.try_get("revoked_at").ok().flatten();
+    let revoked_at: Option<String> = row.try_get("revoked_at").map_err(err500)?;
     if revoked_at.is_some() {
         return Err((StatusCode::FORBIDDEN, "agent session revoked".into()));
     }
@@ -2191,7 +2471,7 @@ pub async fn issue_token(
     }
 
     let now = Utc::now();
-    let exp = now + Duration::seconds(req.ttl_seconds.clamp(30, 3600));
+    let exp = now + Duration::seconds(req.ttl_seconds);
     let jti = Uuid::new_v4().to_string();
     let aud = token_audience(&req.gateway_id, &req.server_id, &req.tool_name);
 
@@ -2211,7 +2491,12 @@ pub async fn issue_token(
         exp: exp.timestamp(),
     };
 
-    let token = state.signer.sign_token(&claims).map_err(err500)?;
+    let signer = Arc::clone(&state.signer);
+    let claims_to_sign = claims.clone();
+    let token = tokio::task::spawn_blocking(move || signer.sign_token(&claims_to_sign))
+        .await
+        .map_err(err500)?
+        .map_err(err500)?;
     sqlx::query(
         "INSERT INTO issued_tokens
              (jti, agent_session_id, gateway_id, server_id, tool_name, issued_at, not_before, expires_at)
@@ -2253,9 +2538,10 @@ pub async fn introspect_token(
     let claims = match state.signer.verify_token(&req.token, true) {
         Ok(claims) => claims,
         Err(e) => {
-            return Ok(Json(inactive_token_response(format!(
-                "token signature or claims failed verification: {e}"
-            ))))
+            tracing::warn!(error = %e, "token introspection rejected an invalid token");
+            return Ok(Json(inactive_token_response(
+                "token signature or claims failed verification",
+            )));
         }
     };
 
@@ -2286,7 +2572,7 @@ pub async fn introspect_token(
             "token id was not issued by this control plane",
         )));
     };
-    let used_at: Option<String> = token_row.try_get("used_at").ok().flatten();
+    let used_at: Option<String> = token_row.try_get("used_at").map_err(err500)?;
     if used_at.is_some() {
         return Ok(Json(inactive_token_response("token id was already used")));
     }
@@ -2316,7 +2602,7 @@ pub async fn introspect_token(
             "token actor does not match agent session owner",
         )));
     }
-    let session_revoked_at: Option<String> = session_row.try_get("revoked_at").ok().flatten();
+    let session_revoked_at: Option<String> = session_row.try_get("revoked_at").map_err(err500)?;
     if session_revoked_at.is_some() {
         return Ok(Json(inactive_token_response("agent session is revoked")));
     }
@@ -2396,21 +2682,35 @@ pub async fn set_org_policy(
     principal: AuthedPrincipal,
     Json(req): Json<SetOrgPolicyRequest>,
 ) -> ApiResult<Json<OrgPolicy>> {
+    validate_identifier("policy scope", &scope)?;
     ensure_scope_owner(&state, &principal, &scope).await?;
+    if req.rego_source.len() > 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Rego policy exceeds the 1 MiB size limit".into(),
+        ));
+    }
 
     // Reject bad Rego at write time, not at eval-in-the-hot-path time.
     // Compilation success does NOT mean the policy is safe - it only means
     // it parses. The floor (see mcp-warden's policy.rs) is what actually
     // keeps a badly-reasoned policy from being able to do damage.
-    let mut engine = regorus::Engine::new();
-    engine
-        .add_policy("org_policy.rego".to_string(), req.rego_source.clone())
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("rego does not compile: {e}"),
-            )
-        })?;
+    let source = req.rego_source.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("org_policy.rego".to_string(), source)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(err500)?
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("rego does not compile: {e}"),
+        )
+    })?;
 
     let next_version_row =
         sqlx::query("SELECT COALESCE(MAX(version), 0) as v FROM org_policies WHERE scope = $1")
@@ -2418,7 +2718,7 @@ pub async fn set_org_policy(
             .fetch_one(&state.pool)
             .await
             .map_err(err500)?;
-    let next_version: i64 = next_version_row.try_get::<i64, _>("v").unwrap_or(0) + 1;
+    let next_version: i64 = next_version_row.try_get::<i64, _>("v").map_err(err500)? + 1;
 
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();

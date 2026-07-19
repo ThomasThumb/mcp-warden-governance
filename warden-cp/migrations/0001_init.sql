@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     tool_name           TEXT NOT NULL,
     args_fingerprint    TEXT NOT NULL,
     risk_tier           TEXT NOT NULL,
-    status              TEXT NOT NULL,  -- 'pending' | 'approved' | 'denied' | 'expired'
+    status              TEXT NOT NULL,  -- 'pending' | 'approved' | 'denied' | 'consumed' | 'expired'
     requested_at        TEXT NOT NULL,
     decided_at          TEXT,
     decided_by          TEXT REFERENCES principals(id),

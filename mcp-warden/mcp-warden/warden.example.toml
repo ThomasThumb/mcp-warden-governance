@@ -15,7 +15,8 @@ rego_policy_path = "warden.rego"
 url = "http://localhost:7878"
 gateway_id = "laptop-jane"
 owner_principal_id = "replace-with-a-real-principal-id"
-api_key = "paste-the-key-warden-cp-printed-on-first-run-here"
+# Store the key in this environment variable; never paste it into this file.
+api_key_env = "MCP_WARDEN_CP_API_KEY"
 max_degraded_minutes = 60
 # Optional if the control plane is reachable at startup; the gateway will fetch
 # /v1/signer/public-key. Set it explicitly for degraded/offline verification.
@@ -77,7 +78,12 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 default_risk = "require_approval"
 
 [servers.env]
-GITHUB_TOKEN = "" # set via your shell/secret manager, don't commit a real one
+NODE_ENV = "production"
+
+# Only explicitly named parent variables cross into the child process. This
+# keeps unrelated credentials out of an untrusted upstream MCP server.
+[servers.env_from]
+GITHUB_TOKEN = "GITHUB_TOKEN"
 
 [servers.tools.search_issues]
 risk = "read_only"

@@ -1,5 +1,6 @@
 use crate::config::UpstreamConfig;
 use anyhow::Result;
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
@@ -23,6 +24,12 @@ pub struct TokenIntrospection {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalState {
+    pub id: String,
+    pub status: String,
+}
+
 #[derive(Clone)]
 pub struct CpClient {
     base_url: String,
@@ -32,17 +39,19 @@ pub struct CpClient {
 }
 
 impl CpClient {
-    pub fn new(base_url: String, gateway_id: String, api_key: String) -> Self {
+    pub fn new(base_url: String, gateway_id: String, api_key: String) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
-            .expect("reqwest client");
-        Self {
+            .map_err(|e| anyhow::anyhow!("building control-plane HTTP client: {e}"))?;
+        Ok(Self {
             base_url,
             gateway_id,
             api_key,
             http,
-        }
+        })
     }
 
     pub fn gateway_id(&self) -> &str {
@@ -109,7 +118,7 @@ impl CpClient {
             return Ok(None);
         }
         let resp = resp.error_for_status()?;
-        let v: serde_json::Value = resp.json().await?;
+        let v: serde_json::Value = response_json_limited(resp, 4 * 1024 * 1024).await?;
         Ok(v.get("bundle").cloned())
     }
 
@@ -134,7 +143,7 @@ impl CpClient {
             .send()
             .await?
             .error_for_status()?;
-        let v: serde_json::Value = resp.json().await?;
+        let v: serde_json::Value = response_json_limited(resp, 1024 * 1024).await?;
         Ok(v.get("status")
             .and_then(|s| s.as_str())
             .unwrap_or("pending")
@@ -159,7 +168,7 @@ impl CpClient {
             .send()
             .await?
             .error_for_status()?;
-        let v: serde_json::Value = resp.json().await?;
+        let v: serde_json::Value = response_json_limited(resp, 1024 * 1024).await?;
         let ed25519_public_key_b64 = v
             .get("ed25519_public_key_b64")
             .and_then(|s| s.as_str())
@@ -188,7 +197,7 @@ impl CpClient {
             .send()
             .await?
             .error_for_status()?;
-        Ok(resp.json().await?)
+        response_json_limited(resp, 1024 * 1024).await
     }
 
     pub async fn create_approval(
@@ -198,7 +207,7 @@ impl CpClient {
         tool_name: &str,
         args_fingerprint: &str,
         risk_tier: &str,
-    ) -> Result<String> {
+    ) -> Result<ApprovalState> {
         let body = json!({
             "gateway_id": self.gateway_id,
             "agent_session_id": agent_session_id,
@@ -213,28 +222,42 @@ impl CpClient {
             .send()
             .await?
             .error_for_status()?;
-        let v: serde_json::Value = resp.json().await?;
-        Ok(v.get("id")
-            .and_then(|s| s.as_str())
-            .unwrap_or_default()
-            .to_string())
+        response_json_limited(resp, 1024 * 1024).await
     }
 
-    pub async fn poll_approval(&self, id: &str) -> Result<String> {
+    pub async fn consume_approval(&self, id: &str) -> Result<ApprovalState> {
         let resp = self
             .authed(
                 self.http
-                    .get(format!("{}/v1/approvals/{}", self.base_url, id)),
+                    .post(format!("{}/v1/approvals/{}/consume", self.base_url, id)),
             )
             .send()
             .await?
             .error_for_status()?;
-        let v: serde_json::Value = resp.json().await?;
-        Ok(v.get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("pending")
-            .to_string())
+        response_json_limited(resp, 1024 * 1024).await
     }
+}
+
+async fn response_json_limited<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("control-plane response exceeds the {limit}-byte limit");
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("control-plane response exceeds the {limit}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(Into::into)
 }
 
 fn hostname() -> String {

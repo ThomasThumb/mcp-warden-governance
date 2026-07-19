@@ -12,6 +12,7 @@ pub struct Principal {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePrincipalRequest {
     pub kind: String,
     pub display_name: String,
@@ -19,16 +20,19 @@ pub struct CreatePrincipalRequest {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CreateApiKeyRequest {
     pub principal_id: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SetPrincipalRolesRequest {
     pub roles: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SetGroupRolesRequest {
     pub roles: Vec<String>,
 }
@@ -130,6 +134,7 @@ pub struct SecurityAnomaly {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterGatewayRequest {
     pub gateway_id: String,
     pub owner_principal_id: String,
@@ -139,12 +144,14 @@ pub struct RegisterGatewayRequest {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamReport {
     pub server_id: String,
     pub transport: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ToolFingerprintReport {
     pub gateway_id: String,
     pub server_id: String,
@@ -158,6 +165,7 @@ pub struct ToolFingerprintDecision {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyBundle {
     pub scope: String,
     pub version: i64,
@@ -167,6 +175,7 @@ pub struct PolicyBundle {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CreateApprovalRequest {
     pub gateway_id: String,
     pub agent_session_id: Option<String>,
@@ -190,15 +199,18 @@ pub struct ApprovalRequest {
     pub decided_at: Option<String>,
     pub decided_by: Option<String>,
     pub reason: Option<String>,
+    pub used_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DecideApprovalRequest {
     pub approved: bool,
     pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuditEventIn {
     pub gateway_id: String,
     pub agent_session_id: Option<String>,
@@ -212,6 +224,7 @@ pub struct AuditEventIn {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MintAgentSessionRequest {
     pub principal_id: String,
     pub purpose: Option<String>,
@@ -220,6 +233,7 @@ pub struct MintAgentSessionRequest {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IssueTokenRequest {
     pub agent_session_id: String,
     pub gateway_id: String,
@@ -235,6 +249,7 @@ pub struct IssuedToken {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IntrospectTokenRequest {
     pub token: String,
 }
@@ -252,6 +267,7 @@ pub struct IntrospectTokenResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SetOrgPolicyRequest {
     pub rego_source: String,
 }

@@ -1,11 +1,31 @@
 [package]
 name = "mcp-warden"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "A zero-trust security and governance proxy for MCP servers"
-license = "Apache-2.0"
 
 [dependencies]
+# Shared with warden-cp via [workspace.dependencies] — versions live in the
+# workspace root so the token/audit signer and verifier can never skew.
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+ml-dsa.workspace = true
+regorus.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+# mcp-warden only
 # Official Rust MCP SDK. We deliberately skip the "macros" feature: this gateway
 # proxies a *dynamic* tool set discovered at runtime from upstream servers, so we
 # implement ServerHandler/ClientHandler by hand instead of the static #[tool] macros.
@@ -15,20 +35,6 @@ rmcp = { version = "2", default-features = false, features = [
     "transport-child-process",
     "transport-io",
 ] }
-tokio = { version = "1", features = ["full"] }
-regorus = { version = "0.10.1", default-features = false, features = ["opa-no-std"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "0.8"
-sha2 = "0.10"
 regex = "1"
-anyhow = "1"
-chrono = "0.4"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-base64 = "0.22"
-ed25519-dalek = "2"
-ml-dsa = "0.1.1"
-futures-util = "0.3"
+serde_ignored = "0.1"

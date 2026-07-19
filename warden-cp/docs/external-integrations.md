@@ -13,10 +13,16 @@ Environment:
 
 ```bash
 export AUDIT_ANCHOR_REQUIRED=true
-export AUDIT_ANCHOR_COMMAND="pwsh"
-export AUDIT_ANCHOR_ARGS_JSON='["-File","warden-cp/scripts/audit_anchor_s3_object_lock_adapter.ps1"]'
+export AUDIT_ANCHOR_COMMAND="/usr/bin/pwsh"
+export AUDIT_ANCHOR_ARGS_JSON='["-File","/opt/warden/adapters/audit_anchor_s3_object_lock_adapter.ps1"]'
+export AUDIT_ANCHOR_ENV_FROM_JSON='{"AUDIT_ANCHOR_S3_BUCKET":"AUDIT_ANCHOR_S3_BUCKET","AUDIT_ANCHOR_S3_PREFIX":"AUDIT_ANCHOR_S3_PREFIX","AUDIT_ANCHOR_S3_RETENTION_DAYS":"AUDIT_ANCHOR_S3_RETENTION_DAYS"}'
 export AUDIT_ANCHOR_TIMEOUT_MS=5000
 ```
+
+The executable and adapter paths must be absolute. The child starts with an
+empty environment; `AUDIT_ANCHOR_ENV_FROM_JSON` explicitly maps each child
+variable name to the parent variable that supplies its value. No other parent
+credentials or process settings cross the boundary.
 
 Request shapes:
 
@@ -61,10 +67,15 @@ Environment:
 ```bash
 export WARDEN_SIGNER_COMMAND="/opt/warden/signers/prod-signer"
 export WARDEN_SIGNER_ARGS_JSON='["--profile","prod"]'
+export WARDEN_SIGNER_ENV_FROM_JSON='{"KMS_KEY_ID":"WARDEN_KMS_KEY_ID","KMS_REGION":"WARDEN_KMS_REGION"}'
 export WARDEN_SIGNER_TIMEOUT_MS=5000
 export WARDEN_SIGNER_ED25519_PUBLIC_KEY_B64="..."
 export WARDEN_SIGNER_ML_DSA65_PUBLIC_KEY_B64="..."
 ```
+
+`WARDEN_SIGNER_COMMAND` must be absolute. The signer also starts with an empty
+environment and receives only the child-to-parent mappings declared in
+`WARDEN_SIGNER_ENV_FROM_JSON`.
 
 Request:
 
