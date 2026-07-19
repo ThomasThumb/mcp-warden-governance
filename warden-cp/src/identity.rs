@@ -142,16 +142,38 @@ impl HybridSigner {
     /// OS keystore and return signatures over the exact bytes supplied here.
     ///
     /// Without WARDEN_SIGNER_COMMAND, this falls back to local development key
-    /// files with owner-only permissions. Those files are convenient for dev
-    /// and demos, but production should prefer the external signer boundary.
-    pub fn load_or_generate(path: &Path, ml_dsa_path: Option<&Path>) -> anyhow::Result<Self> {
-        if let Some(external) = ExternalSigner::from_env()? {
+    /// files with owner-only permissions unless `require_external` is true.
+    /// Those files are convenient for dev and demos, but production should
+    /// require the external signer boundary.
+    pub fn load_or_generate(
+        path: &Path,
+        ml_dsa_path: Option<&Path>,
+        require_external: bool,
+    ) -> anyhow::Result<Self> {
+        let external = ExternalSigner::from_env(require_external)?;
+        Self::load_or_generate_with_external(path, ml_dsa_path, require_external, external)
+    }
+
+    fn load_or_generate_with_external(
+        path: &Path,
+        ml_dsa_path: Option<&Path>,
+        require_external: bool,
+        external: Option<ExternalSigner>,
+    ) -> anyhow::Result<Self> {
+        if let Some(external) = external {
             tracing::info!(
                 "using external signing command; private signer keys stay out of warden-cp"
             );
             return Ok(Self {
                 backend: SignerBackend::External(external),
             });
+        }
+
+        if require_external {
+            anyhow::bail!(
+                "WARDEN_REQUIRE_EXTERNAL_SIGNER=true requires WARDEN_SIGNER_COMMAND and valid \
+                 Ed25519 plus ML-DSA-65 public verification keys; refusing local key fallback"
+            );
         }
 
         let ed25519 = if let Ok(bytes) = std::fs::read(path) {
@@ -163,9 +185,9 @@ impl HybridSigner {
             let mut csprng = OsRng;
             let signing_key = Ed25519SigningKey::generate(&mut csprng);
             write_secret_key_file(path, &signing_key.to_bytes())?;
-            tracing::warn!(
-                "generated a new local Ed25519 signing key at {path:?}; use WARDEN_SIGNER_COMMAND \
-                 for KMS/HSM/OS-keystore-backed production signing"
+            tracing::info!(
+                "generated a new local-development Ed25519 signing key at {path:?}; production \
+                 builds require WARDEN_SIGNER_COMMAND by default"
             );
             signing_key
         };
@@ -410,7 +432,7 @@ impl LocalSigner {
 }
 
 impl ExternalSigner {
-    fn from_env() -> anyhow::Result<Option<Self>> {
+    fn from_env(require_ml_dsa: bool) -> anyhow::Result<Option<Self>> {
         let Some(command) = ExternalCommand::from_env(
             "WARDEN_SIGNER_COMMAND",
             "WARDEN_SIGNER_ARGS_JSON",
@@ -432,6 +454,12 @@ impl ExternalSigner {
             .transpose()?;
         if let Some(key) = &ml_dsa65_public_key {
             MlDsaVerifyingKey::<MlDsa65>::new_from_slice(key)?;
+        } else if require_ml_dsa {
+            anyhow::bail!(
+                "WARDEN_REQUIRE_EXTERNAL_SIGNER=true requires \
+                 WARDEN_SIGNER_ML_DSA65_PUBLIC_KEY_B64; the Ed25519-only migration exception \
+                 is disabled in fail-closed production mode"
+            );
         } else if !bool_env("WARDEN_SIGNER_ALLOW_ED25519_ONLY")? {
             anyhow::bail!(
                 "WARDEN_SIGNER_COMMAND requires WARDEN_SIGNER_ML_DSA65_PUBLIC_KEY_B64; \
@@ -584,9 +612,9 @@ fn load_or_generate_ml_dsa(path: &Path) -> anyhow::Result<MlDsaSigningKey<MlDsa6
 
     let key = MlDsaSigningKey::<MlDsa65>::generate();
     write_secret_key_file(path, key.to_seed().as_slice())?;
-    tracing::warn!(
-        "generated a new local ML-DSA-65 signing key at {path:?}; use WARDEN_SIGNER_COMMAND \
-         for KMS/HSM/OS-keystore-backed production signing"
+    tracing::info!(
+        "generated a new local-development ML-DSA-65 signing key at {path:?}; production builds \
+         require WARDEN_SIGNER_COMMAND by default"
     );
     Ok(key)
 }
@@ -671,6 +699,28 @@ fn restrict_key_file_windows(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn temporary_key_paths(test_name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("warden-cp-{test_name}-{}", uuid::Uuid::new_v4()));
+        (
+            directory.join("ed25519.key"),
+            directory.join("ml-dsa65.key"),
+        )
+    }
+
+    fn remove_temporary_key_paths(ed25519: &Path, ml_dsa65: &Path) {
+        for path in [ed25519, ml_dsa65] {
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        if let Some(directory) = ed25519.parent() {
+            if directory.exists() {
+                std::fs::remove_dir(directory).unwrap();
+            }
+        }
+    }
+
     fn test_signer() -> HybridSigner {
         HybridSigner {
             backend: SignerBackend::Local(LocalSigner {
@@ -699,6 +749,48 @@ mod tests {
             iat: now,
             exp: now + 60,
         }
+    }
+
+    #[test]
+    fn required_external_signer_refuses_local_key_fallback_without_writes() {
+        let (ed25519, ml_dsa65) = temporary_key_paths("required-external-signer");
+
+        let error =
+            HybridSigner::load_or_generate_with_external(&ed25519, Some(&ml_dsa65), true, None)
+                .err()
+                .expect("strict signer mode must fail without an external signer");
+
+        assert!(error
+            .to_string()
+            .contains("WARDEN_REQUIRE_EXTERNAL_SIGNER=true"));
+        assert!(!ed25519.exists());
+        assert!(!ml_dsa65.exists());
+        remove_temporary_key_paths(&ed25519, &ml_dsa65);
+    }
+
+    #[test]
+    fn local_development_signer_still_generates_and_reloads_keys() {
+        let (ed25519, ml_dsa65) = temporary_key_paths("local-development-signer");
+
+        let generated =
+            HybridSigner::load_or_generate_with_external(&ed25519, Some(&ml_dsa65), false, None)
+                .expect("local development signer should generate keys");
+        assert!(ed25519.exists());
+        assert!(ml_dsa65.exists());
+
+        let reloaded =
+            HybridSigner::load_or_generate_with_external(&ed25519, Some(&ml_dsa65), false, None)
+                .expect("local development signer should reload persisted keys");
+        assert_eq!(
+            generated.ed25519_verifying_key_b64(),
+            reloaded.ed25519_verifying_key_b64()
+        );
+        assert_eq!(
+            generated.ml_dsa65_verifying_key_b64(),
+            reloaded.ml_dsa65_verifying_key_b64()
+        );
+
+        remove_temporary_key_paths(&ed25519, &ml_dsa65);
     }
 
     #[test]

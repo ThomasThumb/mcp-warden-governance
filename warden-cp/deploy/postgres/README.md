@@ -18,7 +18,7 @@ an immutable upstream revision with a patched Go toolchain and `x/sys`.
 
 ```bash
 cp .env.example .env
-# edit POSTGRES_PASSWORD, TRUST_DOMAIN, WARDEN_CP_BIND
+# edit POSTGRES_PASSWORD, TRUST_DOMAIN, WARDEN_CP_BIND, and signer settings
 docker compose --env-file .env up --build
 ```
 
@@ -53,10 +53,27 @@ At least once before production use:
 
 ## Production Notes
 
-- Store `.env`, `warden-cp-signing.key`, and `warden-cp-ml-dsa65.key`
-  outside source control.
-- Back up both signing keys; losing either invalidates issued hybrid tokens.
+- Set `WARDEN_REQUIRE_EXTERNAL_SIGNER=true`. Production startup then fails
+  before database bootstrap unless `WARDEN_SIGNER_COMMAND` and valid Ed25519
+  plus ML-DSA-65 public verification keys are configured. The Ed25519-only
+  migration exception is deliberately unavailable in this mode. The production
+  image and Postgres-only binary default to `true`; the checked-in
+  `.env.example` explicitly selects `false` only so its localhost development
+  quick start remains usable.
+- Mount the signer adapter read-only at its absolute in-container path and use
+  `WARDEN_SIGNER_ENV_FROM_JSON` to expose only the exact KMS/HSM/Vault settings
+  it needs. The child process inherits no other environment variables.
+- Keep `.env` outside source control. A local-only deployment with
+  `WARDEN_REQUIRE_EXTERNAL_SIGNER=false` must also protect and back up
+  `warden-cp-signing.key` and `warden-cp-ml-dsa65.key`; losing them invalidates
+  issued hybrid tokens.
 - Configure OIDC/SCIM through environment and a dedicated admin principal
   before connecting an enterprise IdP.
 - Monitor disk usage, connection count, slow queries, and failed auth.
 - Do not expose either Postgres or `warden-cp` directly to the internet.
+
+Code-signing certificates, TLS certificates, and runtime signer keys solve
+different problems. A code-signing certificate identifies the software
+publisher, and a TLS certificate authenticates the network endpoint. Neither
+persists or protects the Ed25519/ML-DSA keys used to sign Warden tokens and
+audit checkpoints; those keys belong in the managed signer configured above.

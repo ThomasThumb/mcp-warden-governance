@@ -89,7 +89,7 @@ on any vulnerability or embedded secret.
 ```bash
 cd deploy/postgres
 cp .env.example .env
-# edit POSTGRES_PASSWORD, TRUST_DOMAIN, and WARDEN_CP_BIND as needed
+# edit POSTGRES_PASSWORD, TRUST_DOMAIN, WARDEN_CP_BIND, and signer settings
 docker compose --env-file .env up --build
 ```
 
@@ -209,7 +209,13 @@ For production key custody, set `WARDEN_SIGNER_COMMAND` and keep the Ed25519
 and ML-DSA private keys in KMS, HSM, Vault Transit, PKCS#11, Windows
 CNG/DPAPI, or another managed key boundary. The command protocol is documented
 in `docs/external-integrations.md`; `warden-cp` verifies returned signatures
-against configured public keys before accepting them.
+against configured public keys before accepting them. Also set
+`WARDEN_REQUIRE_EXTERNAL_SIGNER=true` so a missing or incomplete external
+signer fails startup before database bootstrap and can never fall back to
+generating local keys. Strict mode requires both Ed25519 and ML-DSA-65. The
+production container image enables strict mode by default; local binary
+development does not. The Postgres-only production build also defaults to
+strict mode when run outside the container.
 
 For "harvest now, decrypt later" risk, transport confidentiality is the
 priority. Use a TLS 1.3 reverse proxy or TLS provider that supports a
@@ -230,8 +236,9 @@ Key holes from v0.1 are fixed:
   that authenticated identity, not a field in the request body.
 - **The signing key persists for local dev** (`SIGNING_KEY_PATH`, default
   `warden-cp-signing.key`, written with owner-only permissions). Production
-  can set `WARDEN_SIGNER_COMMAND` so private signing keys stay outside the
-  process in a KMS/HSM/OS-keystore-backed adapter.
+  should set both `WARDEN_SIGNER_COMMAND` and
+  `WARDEN_REQUIRE_EXTERNAL_SIGNER=true` so private signing keys stay outside
+  the process in a KMS/HSM/OS-keystore-backed adapter and startup fails closed.
 - **Scoped tokens are signed as protected envelopes.** The signed input now
   includes the token header, algorithm, key IDs, audience, `nbf`, `jti`, and
   payload. Gateways use strict Ed25519 verification and require ML-DSA-65 by

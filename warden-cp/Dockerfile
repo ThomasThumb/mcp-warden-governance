@@ -33,6 +33,10 @@ FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:7ff79e2caef2b8a137ddaf9940fb
 COPY --chown=65532:65532 LICENSE /var/lib/warden-cp/LICENSE
 WORKDIR /var/lib/warden-cp
 COPY --from=build --chown=65532:65532 /src/target/release/warden-cp /usr/local/bin/warden-cp
+# Production images fail closed if managed signing is omitted. Local binary
+# development retains its convenient file-backed default; Compose must make
+# any local-only override explicit.
+ENV WARDEN_REQUIRE_EXTERNAL_SIGNER=true
 USER 65532:65532
 EXPOSE 7878
 # No HEALTHCHECK on purpose: the service intentionally exposes no

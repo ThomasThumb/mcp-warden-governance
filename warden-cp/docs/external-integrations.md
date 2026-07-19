@@ -65,6 +65,7 @@ before accepting them.
 Environment:
 
 ```bash
+export WARDEN_REQUIRE_EXTERNAL_SIGNER=true
 export WARDEN_SIGNER_COMMAND="/opt/warden/signers/prod-signer"
 export WARDEN_SIGNER_ARGS_JSON='["--profile","prod"]'
 export WARDEN_SIGNER_ENV_FROM_JSON='{"KMS_KEY_ID":"WARDEN_KMS_KEY_ID","KMS_REGION":"WARDEN_KMS_REGION"}'
@@ -102,4 +103,11 @@ The service rejects malformed signatures, wrong public keys, missing ML-DSA when
 required, command failures, and command timeouts. If an external signer can only
 provide Ed25519 during a migration, `WARDEN_SIGNER_ALLOW_ED25519_ONLY=true`
 allows startup, but this should be treated as a temporary exception and logged
-in the deployment risk register.
+in the deployment risk register. The exception is ignored when
+`WARDEN_REQUIRE_EXTERNAL_SIGNER=true`; production fail-closed mode requires
+both Ed25519 and ML-DSA-65 and never falls back to local key generation.
+
+Configure `WARDEN_REQUIRE_EXTERNAL_SIGNER=true` for production. Signer
+configuration is validated before the database is opened or the first root key
+is bootstrapped, so a missing signer command configuration or verification key
+stops startup without creating signer files or mutating application state.

@@ -110,6 +110,11 @@ jobs:
       - name: Build production application image
         run: docker build -f warden-cp/Dockerfile -t warden-cp:security .
 
+      - name: Verify production signer policy is fail closed
+        run: |
+          docker inspect warden-cp:security --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            | grep -Fx 'WARDEN_REQUIRE_EXTERNAL_SIGNER=true'
+
       - name: Build hardened PostgreSQL 17 image
         run: docker build -f warden-cp/deploy/postgres/Dockerfile -t warden-postgres:security .
 

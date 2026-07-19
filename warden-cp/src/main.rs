@@ -76,13 +76,17 @@ fn is_loopback_bind(bind_addr: &str) -> bool {
 }
 
 fn bool_env(name: &str) -> anyhow::Result<bool> {
+    bool_env_with_default(name, false)
+}
+
+fn bool_env_with_default(name: &str, default: bool) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" => Ok(true),
             "0" | "false" | "no" => Ok(false),
             _ => anyhow::bail!("{name} must be one of true, false, 1, 0, yes, or no"),
         },
-        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotPresent) => Ok(default),
         Err(e) => Err(e.into()),
     }
 }
@@ -147,13 +151,14 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("ML_DSA_SIGNING_KEY_PATH")
             .unwrap_or_else(|_| "warden-cp-ml-dsa65.key".to_string()),
     );
-
-    let pool = db::connect(&database_url).await?;
-    auth::bootstrap_root_key_if_needed(&pool).await?;
+    let production_postgres_build = cfg!(all(feature = "postgres", not(feature = "sqlite")));
+    let require_external_signer =
+        bool_env_with_default("WARDEN_REQUIRE_EXTERNAL_SIGNER", production_postgres_build)?;
 
     let signer = Arc::new(identity::HybridSigner::load_or_generate(
         &signing_key_path,
         Some(&ml_dsa_key_path),
+        require_external_signer,
     )?);
     tracing::info!(
         "Ed25519 signer public key (share with gateways for offline token verification): {}",
@@ -162,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(key) = signer.ml_dsa65_verifying_key_b64() {
         tracing::info!("ML-DSA-65 signer public key: {key}");
     }
+
+    let pool = db::connect(&database_url).await?;
+    auth::bootstrap_root_key_if_needed(&pool).await?;
 
     routes::seal_legacy_audit_if_needed(&pool, signer.as_ref()).await?;
     let chain_tail = load_chain_tail(&pool).await?;

@@ -74,6 +74,10 @@ Current cryptographic posture:
 - **Key custody:** local owner-only key files are supported for development.
   Production can use the external signer command contract to keep private keys
   in KMS, HSM, Vault, PKCS#11, Windows CNG/DPAPI, or another managed boundary.
+  Set `WARDEN_REQUIRE_EXTERNAL_SIGNER=true` in production to reject missing or
+  incomplete signer configuration before local keys or database state are
+  created. The production container image enables this fail-closed setting by
+  default, as does the Postgres-only production binary.
 
 ## Quick Start
 
