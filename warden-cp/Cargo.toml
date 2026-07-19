@@ -32,7 +32,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 # warden-cp only
-axum = "0.7"
+axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
