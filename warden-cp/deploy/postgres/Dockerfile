@@ -1,7 +1,7 @@
 # Build the tiny privilege-drop helper from an immutable upstream revision.
 # gosu's upstream module pins an old x/sys; requiring the fixed version in
 # this main module makes Go's minimal-version selection use it without a fork.
-FROM golang:1.25.12-alpine3.24@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS gosu-build
+FROM golang:1.26.8-alpine3.24@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS gosu-build
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
 WORKDIR /src
@@ -49,10 +49,12 @@ RUN mkdir /src \
 FROM postgres:17.10-alpine3.24@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 AS entrypoint-source
 
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS postgres-runtime
+# apk add otherwise keeps the older, already-installed OpenSSL from the base.
+# libssl3 requires the matching libcrypto3, so this upgrades both runtime libs.
 RUN apk add --no-cache \
         bash \
         ca-certificates \
-        libssl3 \
+        "libssl3>=3.5.8-r0" \
         nss_wrapper \
         tzdata \
         zlib \
