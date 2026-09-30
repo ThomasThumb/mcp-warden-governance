@@ -1,0 +1,134 @@
+# Exercise release action upgrades without publishing, signing, or requesting
+# write/OIDC permissions. The production image still has its separate CI gate.
+name: Action compatibility
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-lint:
+    name: Lint GitHub Actions workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@6026fb2ad3aa556d78b517cf65c8c1f832075860 # v5
+
+      - name: Install actionlint
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: actionlint@1.7.12
+
+      - name: Lint workflows
+        run: actionlint
+
+  release-actions-smoke:
+    name: Release actions (no publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@6026fb2ad3aa556d78b517cf65c8c1f832075860 # v5
+
+      - name: Prepare isolated Docker config
+        run: |
+          mkdir -p "$RUNNER_TEMP/action-smoke-docker"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/action-smoke-docker" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: localhost:5000/warden-action-smoke
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long
+
+      - name: Check metadata and prepare a minimal build fixture
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          printf '%s\n' "$TAGS" | grep -Fx "localhost:5000/warden-action-smoke:sha-${GITHUB_SHA}"
+          mkdir -p "$RUNNER_TEMP/action-smoke"
+          printf 'FROM scratch\nCOPY smoke.txt /smoke.txt\n' > "$RUNNER_TEMP/action-smoke/Dockerfile"
+          printf 'action compatibility smoke test\n' > "$RUNNER_TEMP/action-smoke/smoke.txt"
+
+      - name: Build and load fixture without pushing
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ runner.temp }}/action-smoke
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Verify the image is present locally
+        run: docker image inspect "localhost:5000/warden-action-smoke:sha-${GITHUB_SHA}"
+
+      # This loopback-only fixture implements only the registry login endpoint.
+      # The literal test credentials are disposable and cannot access GHCR.
+      - name: Start local registry authentication fixture
+        run: |
+          python3 .github/scripts/registry-auth-fixture.py > "$RUNNER_TEMP/registry-auth.log" 2>&1 &
+          echo "$!" > "$RUNNER_TEMP/registry-auth.pid"
+          for attempt in {1..30}; do
+            if curl --fail --silent --user ci-smoke:not-a-secret http://127.0.0.1:5000/v2/; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/registry-auth.log"
+          exit 1
+
+      - name: Login only to the local fixture
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: localhost:5000
+          username: ci-smoke
+          password: not-a-secret
+
+      - name: Check local credentials and log out
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          config = Path(os.environ.get('DOCKER_CONFIG', Path.home() / '.docker')) / 'config.json'
+          auth = json.loads(config.read_text())['auths']['localhost:5000']['auth']
+          assert base64.b64decode(auth).decode() == 'ci-smoke:not-a-secret'
+          PY
+          docker logout localhost:5000
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Check cosign version and release CLI flags without signing
+        run: |
+          cosign version | grep -F 'v3.0.6'
+          cosign sign --help > "$RUNNER_TEMP/cosign-sign-help.txt"
+          cosign verify --help > "$RUNNER_TEMP/cosign-verify-help.txt"
+          cosign verify-attestation --help > "$RUNNER_TEMP/cosign-attestation-help.txt"
+          grep -F -- '--yes' "$RUNNER_TEMP/cosign-sign-help.txt"
+          grep -F -- '--certificate-identity-regexp' "$RUNNER_TEMP/cosign-verify-help.txt"
+          grep -F -- '--certificate-oidc-issuer' "$RUNNER_TEMP/cosign-verify-help.txt"
+          grep -F -- '--type' "$RUNNER_TEMP/cosign-attestation-help.txt"
+          grep -F -- '--certificate-identity-regexp' "$RUNNER_TEMP/cosign-attestation-help.txt"
+          grep -F -- '--certificate-oidc-issuer' "$RUNNER_TEMP/cosign-attestation-help.txt"
+
+      - name: Stop local fixture
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/registry-auth.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/registry-auth.pid")"
+          fi
