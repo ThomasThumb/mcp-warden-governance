@@ -20,3 +20,9 @@ updates:
     directory: /warden-cp
     schedule:
       interval: weekly
+
+  # Nested Dockerfiles are not covered by the application-image directory.
+  - package-ecosystem: docker
+    directory: /warden-cp/deploy/postgres
+    schedule:
+      interval: weekly
