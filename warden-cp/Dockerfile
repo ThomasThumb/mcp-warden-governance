@@ -4,7 +4,7 @@
 # Base images are digest-pinned so the signed release image is built by a
 # known compiler and runs on a known minimal userspace.
 # Dependabot's docker ecosystem keeps the digests fresh.
-FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
+FROM rust:1.99-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS build
 WORKDIR /src
 
 # Dependency layer: manifests + lockfile only, so editing source doesn't
