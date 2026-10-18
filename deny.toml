@@ -32,6 +32,9 @@ confidence-threshold = 0.8
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
+    # Keep hyper-util's CONNECT/proxy fixes while upstreams migrate base64.
+    # Both workspace signer/verifier crates still share the 0.22 generation.
+    { crate = "base64@0.22.1", reason = "Workspace, reqwest, SQLx and jsonwebtoken require base64 0.22; hyper-util 0.1.21 requires 0.23" },
     { crate = "block-buffer@0.10.4", reason = "sha2 0.10 and ML-DSA's sha2 0.11 use different block-buffer generations" },
     { crate = "cpufeatures@0.2.17", reason = "curve25519-dalek and sha2 0.10 have not moved to cpufeatures 0.3" },
     { crate = "crypto-common@0.1.6", reason = "Ed25519 uses digest 0.10 while ML-DSA uses digest 0.11" },
