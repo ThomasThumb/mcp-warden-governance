@@ -8,7 +8,9 @@ services:
       context: ../../..
       dockerfile: warden-cp/deploy/postgres/Dockerfile
     restart: unless-stopped
-    init: true
+    # The entrypoint execs PostgreSQL, which handles signals and reaps its
+    # children. An extra root init cannot signal UID 70 with these capabilities.
+    init: false
     read_only: true
     security_opt:
       - no-new-privileges:true
