@@ -1,12 +1,13 @@
 # Build the tiny privilege-drop helper from an immutable upstream revision.
-# gosu's upstream module pins an old x/sys; requiring the fixed version in
-# this main module makes Go's minimal-version selection use it without a fork.
-FROM golang:1.25.12-alpine3.24@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3fd61deb2672c587 AS gosu-build
+# gosu's upstream module pins old user and x/sys dependencies; requiring the
+# fixed versions here makes Go's minimal-version selection use them without a fork.
+FROM golang:1.26.9-alpine3.24@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS gosu-build
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
 WORKDIR /src
 RUN go mod init build.local/gosu \
     && go get github.com/tianon/gosu@6456aaa0f3c854d199d0f037f068eb97515b7513 \
+    && go get github.com/moby/sys/user@v0.4.1 \
     && go get golang.org/x/sys@v0.44.0 \
     && go build -trimpath -ldflags="-s -w -buildid=" \
         -o /go/bin/gosu github.com/tianon/gosu
@@ -15,17 +16,19 @@ RUN go mod init build.local/gosu \
 # storage engine without those optional native parsers, reducing both runtime
 # packages and attack surface. BuildKit verifies the upstream source archive
 # before extraction.
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS postgres-build
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS postgres-build
+# Require patched native libraries even when the pinned base already has an
+# older package installed; apk add alone can otherwise keep that version.
 RUN apk add --no-cache \
         build-base \
         bison \
         bzip2 \
         flex \
         linux-headers \
-        openssl-dev \
+        "openssl-dev>=3.5.9-r0" \
         perl \
         tzdata \
-        zlib-dev
+        "zlib-dev>=1.3.2-r1"
 ADD --checksum=sha256:078a03516dcdbdb705fecaf415ea3d13a956c589e46f09fed68a06fb00598c90 \
     https://ftp.postgresql.org/pub/source/v17.10/postgresql-17.10.tar.bz2 \
     /tmp/postgresql.tar.bz2
@@ -48,14 +51,14 @@ RUN mkdir /src \
 # supplying our smaller server build and runtime filesystem.
 FROM postgres:17.10-alpine3.24@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 AS entrypoint-source
 
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS postgres-runtime
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS postgres-runtime
 RUN apk add --no-cache \
         bash \
         ca-certificates \
-        libssl3 \
+        "libssl3>=3.5.9-r0" \
         nss_wrapper \
         tzdata \
-        zlib \
+        "zlib>=1.3.2-r1" \
     && addgroup -g 70 -S postgres \
     && adduser -u 70 -S -D -G postgres -H -h /var/lib/postgresql -s /bin/sh postgres
 COPY --from=postgres-build /postgres-root/ /
