@@ -29,7 +29,7 @@ RUN touch warden-cp/src/main.rs \
 # CA roots needed by the Rust binary: no package manager, shell, Perl, or
 # login tools. Its stable nonroot identity is 65532:65532. Keep both the tag
 # (so Dependabot can identify the image) and immutable multi-platform digest.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:7ff79e2caef2b8a137ddaf9940fb790e91148482092363760d6661e4591fd54c
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:709673274b417a48f56374da8a7633ef7b2f5b27e34612ce98a335737318cc94
 COPY --chown=65532:65532 LICENSE /var/lib/warden-cp/LICENSE
 WORKDIR /var/lib/warden-cp
 COPY --from=build --chown=65532:65532 /src/target/release/warden-cp /usr/local/bin/warden-cp
