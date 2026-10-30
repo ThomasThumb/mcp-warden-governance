@@ -14,6 +14,13 @@ features this service needs. Unused XML/XSLT, ICU, LDAP, GSSAPI, LLVM, and
 language-extension runtimes are omitted. Its `gosu` helper is also rebuilt from
 an immutable upstream revision with a patched Go toolchain and `x/sys`.
 
+PostgreSQL runs directly as PID 1 after the entrypoint drops to UID 70. The
+profile deliberately disables an extra init process: PostgreSQL handles its
+own children and shutdown signals, while a root init would need another
+capability to forward signals across the UID change. CI runs
+`warden-cp/scripts/test_postgres_lifecycle.ps1` against this Compose profile to
+check normal Docker/Compose stop, clean restart, and committed-data persistence.
+
 ## Start
 
 ```bash
