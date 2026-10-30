@@ -1,7 +1,7 @@
 # Build the tiny privilege-drop helper from an immutable upstream revision.
 # gosu's upstream module pins old user and x/sys dependencies; requiring the
 # fixed versions here makes Go's minimal-version selection use them without a fork.
-FROM golang:1.26.9-alpine3.24@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS gosu-build
+FROM golang:1.26.10-alpine3.24@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308 AS gosu-build
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local
 WORKDIR /src
@@ -19,7 +19,8 @@ RUN go mod init build.local/gosu \
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS postgres-build
 # Require patched native libraries even when the pinned base already has an
 # older package installed; apk add alone can otherwise keep that version.
-RUN apk add --no-cache \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache \
         build-base \
         bison \
         bzip2 \
@@ -52,7 +53,8 @@ RUN mkdir /src \
 FROM postgres:17.10-alpine3.24@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193 AS entrypoint-source
 
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS postgres-runtime
-RUN apk add --no-cache \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache \
         bash \
         ca-certificates \
         "libssl3>=3.5.9-r0" \
@@ -73,6 +75,8 @@ RUN mkdir -p /docker-entrypoint-initdb.d /var/lib/postgresql/data /var/run/postg
     && chmod 1777 /var/lib/postgresql/data \
     && chmod 3777 /var/run/postgresql \
     && gosu postgres postgres --version \
+    && test "$(gosu postgres id -u)" = 70 \
+    && test "$(gosu postgres id -g)" = 70 \
     && rm -f /sbin/apk \
     && rm -rf /etc/apk /var/cache/apk
 
