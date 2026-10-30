@@ -35,6 +35,6 @@ rmcp = { version = "2", default-features = false, features = [
     "transport-child-process",
     "transport-io",
 ] }
-toml = "0.8"
+toml = "1.1"
 regex = "1"
 serde_ignored = "0.1"
